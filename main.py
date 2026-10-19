@@ -5,8 +5,9 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 import gspread
 from google.oauth2.service_account import Credentials
 
-BASE_URL = 'https://ssl.doas.state.ga.us/gpr/'
-SEARCH_URL = BASE_URL + 'index'
+# Current public GPR pages and event details are served on pur.doas.ga.gov.
+BASE_URL = 'https://pur.doas.ga.gov/gpr/'
+SEARCH_URL = BASE_URL
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID', '1T_cg_DBR5WG7vrQZuNqV4hP6BC_BY5sMpwx1v7j5IoU')
 TRACKER_GID = int(os.getenv('TRACKER_GID', '2125924989'))
 REVIEW_GID = int(os.getenv('REVIEW_GID', '1667806659'))
@@ -69,28 +70,51 @@ def get_google_sheets():
     return tracker, review
 
 def ensure_headers(ws, headers):
-    """Ensure all required headers exist and expand the worksheet grid if needed."""
-    existing = ws.row_values(1)
-    if not existing:
-        if ws.col_count < len(headers):
-            ws.resize(rows=ws.row_count, cols=len(headers))
-        ws.update('A1', [headers])
-        return headers
+    """Ensure required headers exist without deleting/reordering existing columns.
 
-    missing = [h for h in headers if h not in existing]
-    if missing:
-        # row_values() omits trailing empty cells, so append after the last
-        # populated header and expand the grid before writing beyond col_count.
-        start_col = len(existing) + 1
-        required_cols = start_col + len(missing) - 1
+    Automatically grows the Google worksheet grid before writing new headers.
+    Existing column names and data are left untouched; missing names are appended
+    to the next free columns. Safe to run on every scheduled execution.
+    """
+    from gspread.utils import rowcol_to_a1
+
+    existing = ws.row_values(1)
+    # Ignore only trailing blank header cells; preserve internal blank columns.
+    while existing and not clean(existing[-1]):
+        existing.pop()
+
+    if not existing:
+        required_cols = len(headers)
         if ws.col_count < required_cols:
-            ws.resize(rows=ws.row_count, cols=required_cols)
-        end_col = required_cols
-        start_letter = gspread.utils.rowcol_to_a1(1, start_col).rstrip('1')
-        end_letter = gspread.utils.rowcol_to_a1(1, end_col).rstrip('1')
-        ws.update(f'{start_letter}1:{end_letter}1', [missing], value_input_option='RAW')
-        existing = ws.row_values(1)
-    return existing
+            ws.add_cols(required_cols - ws.col_count)
+        ws.update(range_name=f"A1:{rowcol_to_a1(1, required_cols)}",
+                  values=[headers], value_input_option="RAW")
+        return list(headers)
+
+    # Treat existing names as authoritative and add only missing required names.
+    # Also avoid adding a duplicate if the same header appears twice in `headers`.
+    existing_names = {clean(h).casefold() for h in existing if clean(h)}
+    missing = []
+    for header in headers:
+        if clean(header).casefold() not in existing_names:
+            missing.append(header)
+            existing_names.add(clean(header).casefold())
+
+    if not missing:
+        return existing
+
+    start_col = len(existing) + 1
+    end_col = start_col + len(missing) - 1
+    if ws.col_count < end_col:
+        # add_cols expands the grid without shrinking existing rows or columns.
+        ws.add_cols(end_col - ws.col_count)
+
+    start_cell = rowcol_to_a1(1, start_col)
+    end_cell = rowcol_to_a1(1, end_col)
+    ws.update(range_name=f"{start_cell}:{end_cell}", values=[missing], value_input_option="RAW")
+    logging.info("Expanded worksheet '%s' as needed; added %d missing headers (%d total columns)",
+                 ws.title, len(missing), end_col)
+    return existing + missing
 
 def rows_as_dicts(ws):
     vals = ws.get_all_values()
@@ -147,8 +171,17 @@ def extract_event_id(url, mapping, text):
     return clean((q.get('eSourceNumber') or q.get('eventId') or [''])[0])
 
 def scrape_search_keyword(page, keyword):
+    # Use the public registry landing page, not the old /index route.
     page.goto(SEARCH_URL, wait_until='domcontentloaded', timeout=60000)
-    page.wait_for_timeout(1200)
+    page.wait_for_timeout(1800)
+    current_url = page.url
+    body_preview = ''
+    try:
+        body_preview = clean(page.locator('body').inner_text(timeout=5000))[:1200]
+    except Exception:
+        pass
+    if '/unsupported' in current_url.lower() or 'unsupported browser' in body_preview.lower():
+        raise RuntimeError(f'GPR returned unsupported-browser page at {current_url}; page text: {body_preview[:500]}')
     # Match the visible field labelled Search Keyword; fall back to a text input.
     field = page.get_by_placeholder(re.compile('Enter Event ID or Title', re.I)).first
     if field.count()==0: field=page.locator('input[type="text"]').first
@@ -166,7 +199,7 @@ def scrape_search_keyword(page, keyword):
     page.wait_for_timeout(800)
     found={}
     for page_no in range(MAX_PAGES_PER_KEYWORD):
-        links=page.locator('a[href*="eventDetails"], a[href*="eventdetails"], a[href*="EventDetails"]')
+        links=page.locator('a[href*="eventDetails" i], a[href*="eventdetails" i], a[href*="eSourceNumber" i]')
         for i in range(links.count()):
             try:
                 href=links.nth(i).get_attribute('href')
@@ -264,7 +297,13 @@ def main():
     found={}; failures=[]
     with sync_playwright() as p:
         browser=p.chromium.launch(headless=True)
-        context=browser.new_context(viewport={'width':1440,'height':1000})
+        context=browser.new_context(
+            viewport={'width':1440,'height':1000},
+            locale='en-US',
+            timezone_id='America/New_York',
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+            extra_http_headers={'Accept-Language':'en-US,en;q=0.9'},
+        )
         page=context.new_page()
         for i,keyword in enumerate(KEYWORDS,1):
             try:
@@ -320,6 +359,17 @@ def main():
     os.makedirs('data',exist_ok=True)
     with open('data/georgia_diagnostics.json','w',encoding='utf-8') as f: json.dump(diagnostics,f,indent=2)
     logging.info('Diagnostics: %s',json.dumps(diagnostics))
-    if not found: raise RuntimeError('No event-detail links were found. Check if the GPR search page selectors/layout changed.')
+    if not found:
+        # Save evidence of the page returned by the portal so a future failure is actionable.
+        try:
+            os.makedirs('data', exist_ok=True)
+            with open('data/gpr_debug.txt','w',encoding='utf-8') as fh:
+                fh.write(f'Last URL: {page.url}\nTitle: {page.title()}\n\n'+clean(page.locator('body').inner_text())[:10000])
+            with open('data/gpr_debug.html','w',encoding='utf-8') as fh:
+                fh.write(page.content())
+            page.screenshot(path='data/gpr_debug.png', full_page=True)
+        except Exception as debug_error:
+            logging.warning('Could not save GPR debug evidence: %s', debug_error)
+        raise RuntimeError('No event-detail links were found. Diagnostics saved under data/gpr_debug.html, data/gpr_debug.txt and data/gpr_debug.png. Check whether GPR returned a search form, results page, or unsupported-browser page.')
 
 if __name__=='__main__': main()
