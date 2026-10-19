@@ -69,14 +69,26 @@ def get_google_sheets():
     return tracker, review
 
 def ensure_headers(ws, headers):
+    """Ensure all required headers exist and expand the worksheet grid if needed."""
     existing = ws.row_values(1)
     if not existing:
+        if ws.col_count < len(headers):
+            ws.resize(rows=ws.row_count, cols=len(headers))
         ws.update('A1', [headers])
         return headers
+
     missing = [h for h in headers if h not in existing]
     if missing:
-        ws.update_cell(1, len(existing)+1, missing[0])
-        for h in missing[1:]: ws.update_cell(1, len(ws.row_values(1))+1, h)
+        # row_values() omits trailing empty cells, so append after the last
+        # populated header and expand the grid before writing beyond col_count.
+        start_col = len(existing) + 1
+        required_cols = start_col + len(missing) - 1
+        if ws.col_count < required_cols:
+            ws.resize(rows=ws.row_count, cols=required_cols)
+        end_col = required_cols
+        start_letter = gspread.utils.rowcol_to_a1(1, start_col).rstrip('1')
+        end_letter = gspread.utils.rowcol_to_a1(1, end_col).rstrip('1')
+        ws.update(f'{start_letter}1:{end_letter}1', [missing], value_input_option='RAW')
         existing = ws.row_values(1)
     return existing
 
