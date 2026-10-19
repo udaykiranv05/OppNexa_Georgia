@@ -1,0 +1,11 @@
+{
+  "run_at": "2026-10-19T15:07:51.295667+00:00",
+  "keywords_total": 26,
+  "unique_events_discovered": 0,
+  "details_attempted": 0,
+  "records_scraped": 0,
+  "search_failures": [],
+  "tracker_gid": 2125924989,
+  "review_gid": 1667806659,
+  "max_details_per_run": 200
+}
