@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+service-account.json
+playwright-report/
+test-results/
