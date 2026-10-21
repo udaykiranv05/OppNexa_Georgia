@@ -1,4 +1,4 @@
-import os, re, json, time, hashlib, logging
+import os, re, json, time, hashlib, logging, csv
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, parse_qs
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -6,8 +6,9 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # Current public GPR pages and event details are served on pur.doas.ga.gov.
-BASE_URL = 'https://pur.doas.ga.gov/gpr/'
-SEARCH_URL = BASE_URL
+BASE_URL = 'https://ssl.doas.state.ga.us/gpr/'
+SEARCH_URL = BASE_URL + 'index?persisted=true'
+CANONICAL_BASE_URL = 'https://pur.doas.ga.gov/gpr/'
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID', '1T_cg_DBR5WG7vrQZuNqV4hP6BC_BY5sMpwx1v7j5IoU')
 TRACKER_GID = int(os.getenv('TRACKER_GID', '2125924989'))
 REVIEW_GID = int(os.getenv('REVIEW_GID', '1667806659'))
@@ -204,7 +205,10 @@ def scrape_search_keyword(page, keyword):
             try:
                 href=links.nth(i).get_attribute('href')
                 if href:
-                    url=urljoin(BASE_URL, href)
+                    url=urljoin(page.url, href)
+                    # Keep the original public URL format used by the registry; pur.doas links also work.
+                    if '/gpr/eventDetails' in url and 'ssl.doas.state.ga.us' not in url:
+                        url = url.replace('https://pur.doas.ga.gov/gpr/', BASE_URL)
                     # stable key: canonical event URL query, preserve actual official URL
                     key=parse_qs(urlparse(url).query).get('eSourceNumber',[url])[0]
                     found[key]={'url':url,'keyword':keyword}
@@ -233,9 +237,11 @@ def scrape_details(page, url, keywords):
             title=clean(page.locator(sel).first.inner_text(timeout=1500))
             if title: break
         except Exception: pass
-    if not title:
-        # Often the event title is the first heading before Event Details.
-        m=re.search(r'^(.*?)\s+(?:Start Date:|Event Details)',text,re.I)
+    if not title or title.lower() in {'event', 'announcement', 'event details'}:
+        # Some GPR layouts expose only a generic heading; recover the solicitation title from page text.
+        m=re.search(r'((?:RFP|RFQ|RFI|ITB|IFB|PE[- ]?)\s*[^\n]{4,180}?)(?=\s+Start Date:|\s+End Date:|\s+Event Details)', text, re.I)
+        if not m:
+            m=re.search(r'^(.*?)\s+(?:Start Date:|Event Details)',text,re.I)
         title=clean(m.group(1)) if m else ''
     agency=first_match(mapping,'agency','governmententity','entityname','agencyname')
     if not agency:
@@ -261,6 +267,7 @@ def scrape_details(page, url, keywords):
     phone=first_match(mapping,'phone','telephone','contactphone')
     if not phone:
         m=re.search(r'(?<!\d)(?:\+?1[-. ]?)?\(?\d{3}\)?[-. ]\d{3}[-. ]\d{4}(?!\d)',text); phone=m.group(0) if m else ''
+        if re.sub(r'\D','',phone) in {'5555555555','0000000000'}: phone=''
     desc=first_match(mapping,'description','eventdescription','scope')
     if not desc:
         m=re.search(r'Description\s+(.*?)(?:\s+NIGP Codes|\s+Documents|\s+Procurement Help Desk)',text,re.I)
@@ -274,7 +281,7 @@ def scrape_details(page, url, keywords):
       'Opportunity ID':event_id or hashlib.sha1(url.encode()).hexdigest()[:12].upper(), 'Date Found':'', 'State':'Georgia',
       'Agency':agency,'Opportunity Title':title,'Solicitation / Reference No.':event_id,'Opportunity Type':event_type or category,
       'Service Category':category,'Official Source URL':url,'Published Date':pub,'Deadline Date':end,'Deadline Time / Time Zone':end,
-      'Estimated Value (if published)':value,'Scope Summary':desc[:4500], 'Eligibility / Mandatory Requirements':'',
+      'Estimated Value (if published)':value,'Scope Summary':(desc[:3500] + ('\nEvent details: '+url+'#pane-eventDetails\nDocuments: '+url+'#pane-documents') if desc else 'Event details: '+url+'#pane-eventDetails\nDocuments: '+url+'#pane-documents'), 'Eligibility / Mandatory Requirements':'',
       'Required Certifications / Experience':'','Contract Duration / Options':'','Incumbent / Prior Award (verified only)':'',
       'Healthcare IT Fit (0-25)':'','Eligibility & Compliance (0-20)':'','Customer / Contract Fit (0-15)':'',
       'Delivery Capability (0-15)':'','Deadline Feasibility (0-10)':'','Commercial Attractiveness (0-10)':'',
@@ -287,6 +294,36 @@ def scrape_details(page, url, keywords):
       'Buyer Contact Phone':phone,'Buyer Contact Email':email,'Buyer Contact Address':address,
       'Contact Extraction Status':'Contact found' if (contact_name or phone or email) else 'Not found on page',
       'Last Updated At':datetime.now().isoformat(timespec='seconds'),'Record Hash':''}
+
+def is_complete_record(row):
+    """Return true only when the core solicitation fields are present and internally usable."""
+    title = clean(row.get('Opportunity Title', ''))
+    agency = clean(row.get('Agency', ''))
+    deadline = clean(row.get('Deadline Date', ''))
+    scope = clean(row.get('Scope Summary', ''))
+    url = clean(row.get('Official Source URL', ''))
+    invalid_title = not title or title.lower() in {'event', 'announcement', 'untitled'}
+    invalid_agency = not agency or agency.lower() in {'unknown', 'n/a', 'none'}
+    has_scope = bool(scope and len(re.sub(r'https?://\S+', '', scope).strip()) >= 30)
+    has_deadline = bool(deadline and re.search(r'20\d{2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec', deadline, re.I))
+    valid_url = 'eventdetails' in url.lower() and 'esourcenumber=' in url.lower()
+    return (not invalid_title and not invalid_agency and (has_scope or has_deadline) and valid_url)
+
+def export_data(records, review_records, diagnostics):
+    os.makedirs('data', exist_ok=True)
+    for basename, rows in [('georgia_leads', records), ('georgia_manual_review', review_records)]:
+        with open(f'data/{basename}.json', 'w', encoding='utf-8') as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+        if rows:
+            columns = list(dict.fromkeys(k for row in rows for k in row.keys()))
+        else:
+            columns = TRACKER_HEADERS if basename == 'georgia_leads' else REVIEW_HEADERS
+        with open(f'data/{basename}.csv', 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.DictWriter(f, fieldnames=columns, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(rows)
+    with open('data/georgia_diagnostics.json', 'w', encoding='utf-8') as f:
+        json.dump(diagnostics, f, ensure_ascii=False, indent=2)
 
 def main():
     tracker, review=get_google_sheets()
@@ -315,9 +352,16 @@ def main():
             except Exception as e:
                 logging.exception('Search failed for keyword: %s',keyword); failures.append({'keyword':keyword,'error':str(e)})
             time.sleep(DELAY)
-        # Revisit all discovered opportunities, including older rows, so changes update existing records.
+        # Revisit newly discovered records and existing tracker records daily, so later edits are detected.
         urls=[]
         for key,item in found.items(): urls.append((key,item))
+        known_urls = {clean(item['url']) for _, item in urls}
+        for old in old_tracker:
+            old_url = clean(old.get('Official Source URL',''))
+            old_id = clean(old.get('Opportunity ID',''))
+            if old_url and old_id and old_url not in known_urls:
+                urls.append((old_id, {'url': old_url, 'keywords': set(filter(None, clean(old.get('Search Keywords Matched','')).split(';')))}))
+                known_urls.add(old_url)
         if len(urls)>MAX_DETAILS:
             # Prioritize new records, then records with oldest verification date.
             urls.sort(key=lambda kv: (0 if kv[0] not in old_by_id else 1, old_by_id.get(kv[0],{}).get('Last Verified Date','')))
@@ -331,7 +375,12 @@ def main():
                 row['Date Found']=prior.get('Date Found') or datetime.now().strftime('%Y-%m-%d')
                 row['First Seen Date']=prior.get('First Seen Date') or row['Date Found']
                 row['Last Seen Date']=datetime.now().strftime('%Y-%m-%d')
-                # Preserve manual-review scoring/notes and owner fields across automated refreshes.
+                # Preserve existing verified values when the page extraction is blank, plus human-entered review fields.
+                for col in ['Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)','Customer / Contract Fit (0-15)','Delivery Capability (0-15)',
+                    'Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)','Information Completeness (0-5)','Total Score (0-100)',
+                    'Mandatory Gate (Pass / Fail / Unknown)','Recommendation (Go / Investigate / No-Go)','Fit Rationale','Risks / Gaps','Next Action','Owner','Review Status','Reviewer Notes',
+                    'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)']:
+                    if clean(prior.get(col,'')) and not clean(row.get(col,'')): row[col]=prior[col]
                 for col in ['Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)','Customer / Contract Fit (0-15)','Delivery Capability (0-15)',
                     'Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)','Information Completeness (0-5)','Total Score (0-100)',
                     'Mandatory Gate (Pass / Fail / Unknown)','Recommendation (Go / Investigate / No-Go)','Fit Rationale','Risks / Gaps','Next Action','Owner','Review Status','Reviewer Notes',
@@ -344,32 +393,29 @@ def main():
                 logging.exception('Detail failed for %s',item['url']); failures.append({'url':item['url'],'error':str(e)})
             time.sleep(DELAY)
         browser.close()
-    if records:
-        added,updated=upsert_sheet(tracker,tracker_headers,records)
+    lead_records=[]
+    review_records=[]
+    for r in records:
+        if is_complete_record(r):
+            lead_records.append(r)
+        else:
+            review_records.append(r)
+    # Tracker contains only records passing core-field validation; ambiguous/incomplete records go to Manual Review.
+    if lead_records:
+        added,updated=upsert_sheet(tracker,tracker_headers,lead_records)
         logging.info('Tracker sync: %s added, %s updated',added,updated)
-        review_records=[]
-        for r in records:
-            # Include records in manual review when new, or already present there; do not duplicate by ID.
-            review_records.append({h:r.get(h,'') for h in review_headers})
-        ra,ru=upsert_sheet(review,review_headers,review_records)
+    if review_records:
+        mapped=[{h:r.get(h,'') for h in review_headers} for r in review_records]
+        ra,ru=upsert_sheet(review,review_headers,mapped)
         logging.info('Manual review sync: %s added, %s updated',ra,ru)
     diagnostics={'run_at':datetime.now(timezone.utc).isoformat(),'keywords_total':len(KEYWORDS),'unique_events_discovered':len(found),
-      'details_attempted':len(urls) if 'urls' in locals() else 0,'records_scraped':len(records) if 'records' in locals() else 0,
-      'search_failures':failures,'tracker_gid':TRACKER_GID,'review_gid':REVIEW_GID,'max_details_per_run':MAX_DETAILS}
-    os.makedirs('data',exist_ok=True)
-    with open('data/georgia_diagnostics.json','w',encoding='utf-8') as f: json.dump(diagnostics,f,indent=2)
+      'details_attempted':len(urls) if 'urls' in locals() else 0,'records_scraped':len(records),'tracker_records':len(lead_records),
+      'manual_review_records':len(review_records),'search_failures':failures,'tracker_gid':TRACKER_GID,'review_gid':REVIEW_GID,'max_details_per_run':MAX_DETAILS}
+    _, tracker_snapshot = rows_as_dicts(tracker)
+    _, review_snapshot = rows_as_dicts(review)
+    export_data(tracker_snapshot, review_snapshot, diagnostics)
     logging.info('Diagnostics: %s',json.dumps(diagnostics))
-    if not found:
-        # Save evidence of the page returned by the portal so a future failure is actionable.
-        try:
-            os.makedirs('data', exist_ok=True)
-            with open('data/gpr_debug.txt','w',encoding='utf-8') as fh:
-                fh.write(f'Last URL: {page.url}\nTitle: {page.title()}\n\n'+clean(page.locator('body').inner_text())[:10000])
-            with open('data/gpr_debug.html','w',encoding='utf-8') as fh:
-                fh.write(page.content())
-            page.screenshot(path='data/gpr_debug.png', full_page=True)
-        except Exception as debug_error:
-            logging.warning('Could not save GPR debug evidence: %s', debug_error)
-        raise RuntimeError('No event-detail links were found. Diagnostics saved under data/gpr_debug.html, data/gpr_debug.txt and data/gpr_debug.png. Check whether GPR returned a search form, results page, or unsupported-browser page.')
+    if not found and not records:
+        raise RuntimeError('No event-detail links were found and no existing events could be refreshed. Inspect data/gpr_debug.txt and data/gpr_debug.html from the workflow artifact.')
 
 if __name__=='__main__': main()
