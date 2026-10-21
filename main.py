@@ -136,7 +136,10 @@ def upsert_sheet(ws, headers, records, key='Opportunity ID'):
         if not k: continue
         values=[rec.get(h,'') for h in headers]
         if k in index:
-            ws.update(f'A{index[k]}', [values], value_input_option='USER_ENTERED'); updated += 1
+            
+            from gspread.utils import rowcol_to_a1
+            end_cell = rowcol_to_a1(index[k], len(headers))
+            ws.update(range_name=f'A{index[k]}:{end_cell}', values=[values], value_input_option='USER_ENTERED'); updated += 1
         else:
             ws.append_row(values, value_input_option='USER_ENTERED'); appended += 1
     return appended, updated
@@ -238,14 +241,14 @@ def scrape_details(page, url, keywords):
             candidates=page.locator(sel).all_inner_texts()
             for candidate in candidates:
                 candidate=clean(candidate)
-                if re.match(r'^(RFP|RFQ|RFI|ITB|IFB|RFx)\\s*[-#:]?\\s*\\w+', candidate, re.I):
+                if re.match(r'^(RFP|RFQ|RFI|ITB|IFB|RFx)\s*[-#:]?\s*\w+', candidate, re.I):
                     title=candidate
                     break
             if title: break
         except Exception: pass
     if not title:
         # Registry page sometimes renders the title as a non-heading element.
-        m=re.search(r'((?:RFP|RFQ|RFI|ITB|IFB)\\s*\\d+\\s*[-:–—]\\s*[^\\n]{4,220}?)(?=\\s+Start Date:|\\s+End Date:|\\s+Event Details)', text, re.I)
+        m=re.search(r'((?:RFP|RFQ|RFI|ITB|IFB)\s*\d+\s*[-:–—]\s*[^\n]{4,220}?)(?=\s+Start Date:|\s+End Date:|\s+Event Details)', text, re.I)
         if m: title=clean(m.group(1))
     if not title:
         title=first_match(mapping,'eventtitle','opportunitytitle','solicitationtitle','title')
@@ -427,16 +430,22 @@ def main():
     if lead_records:
         added,updated=upsert_sheet(tracker,tracker_headers,lead_records)
         logging.info('Tracker sync: %s added, %s updated',added,updated)
+    else:
+        logging.info('Tracker sync: no records passed completeness checks; records will be written to Manual Review')
     if review_records:
         mapped=[{h:r.get(h,'') for h in review_headers} for r in review_records]
         ra,ru=upsert_sheet(review,review_headers,mapped)
         logging.info('Manual review sync: %s added, %s updated',ra,ru)
+    else:
+        logging.info('Manual review sync: no records to add/update')
     diagnostics={'run_at':datetime.now(timezone.utc).isoformat(),'keywords_total':len(KEYWORDS),'unique_events_discovered':len(found),
       'details_attempted':len(urls) if 'urls' in locals() else 0,'records_scraped':len(records),'tracker_records':len(lead_records),
       'manual_review_records':len(review_records),'search_failures':failures,'tracker_gid':TRACKER_GID,'review_gid':REVIEW_GID,'max_details_per_run':MAX_DETAILS}
     _, tracker_snapshot = rows_as_dicts(tracker)
     _, review_snapshot = rows_as_dicts(review)
     export_data(tracker_snapshot, review_snapshot, diagnostics)
+    for filename in ['data/georgia_leads.csv','data/georgia_leads.json','data/georgia_manual_review.csv','data/georgia_manual_review.json','data/georgia_diagnostics.json']:
+        logging.info('Data export ready: %s (%s bytes)', filename, os.path.getsize(filename))
     logging.info('Diagnostics: %s',json.dumps(diagnostics))
     if not found and not records:
         raise RuntimeError('No event-detail links were found and no existing events could be refreshed. Inspect data/gpr_debug.txt and data/gpr_debug.html from the workflow artifact.')
