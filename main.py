@@ -27,7 +27,7 @@ KEYWORDS = [
 
 TRACKER_HEADERS = [
 'Opportunity ID','Date Found','State','Agency','Opportunity Title','Solicitation / Reference No.','Opportunity Type','Service Category',
-'Official Source URL','Agency Site URL','Event ID','Event Type','Event Status','Purchase Type','Category Type','Government Type','Fiscal Year','Published Date','Deadline Date','Deadline Time / Time Zone','Days Until Deadline','Estimated Value (if published)','Scope Summary',
+'Official Source URL','Published Date','Deadline Date','Deadline Time / Time Zone','Estimated Value (if published)','Scope Summary',
 'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)',
 'Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)','Customer / Contract Fit (0-15)','Delivery Capability (0-15)',
 'Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)','Information Completeness (0-5)','Total Score (0-100)',
@@ -37,7 +37,7 @@ TRACKER_HEADERS = [
 'Contact Extraction Status','Last Updated At','Record Hash'
 ]
 REVIEW_HEADERS = ['Opportunity ID','Date Added to Review','State','Agency','Opportunity Title','Solicitation / Reference No.','Event Status',
-'Official Source URL','Agency Site URL','Event ID','Event Type','Event Status','Purchase Type','Category Type','Government Type','Fiscal Year','Published Date','Deadline Date','Deadline Time / Time Zone','Days Until Deadline','Estimated Value (if published)','Scope Summary',
+'Official Source URL','Published Date','Deadline Date','Deadline Time / Time Zone','Estimated Value (if published)','Scope Summary',
 'Eligibility / Mandatory Requirements','Required Certifications / Experience','Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)',
 'Customer / Contract Fit (0-15)','Delivery Capability (0-15)','Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)',
 'Information Completeness (0-5)','Total Score (0-100)','Mandatory Gate (Pass / Fail / Unknown)','Recommendation (Go / Investigate / No-Go)',
@@ -136,10 +136,7 @@ def upsert_sheet(ws, headers, records, key='Opportunity ID'):
         if not k: continue
         values=[rec.get(h,'') for h in headers]
         if k in index:
-            
-            from gspread.utils import rowcol_to_a1
-            end_cell = rowcol_to_a1(index[k], len(headers))
-            ws.update(range_name=f'A{index[k]}:{end_cell}', values=[values], value_input_option='USER_ENTERED'); updated += 1
+            ws.update(f'A{index[k]}', [values], value_input_option='USER_ENTERED'); updated += 1
         else:
             ws.append_row(values, value_input_option='USER_ENTERED'); appended += 1
     return appended, updated
@@ -234,25 +231,19 @@ def scrape_details(page, url, keywords):
     text=clean(page.locator('body').inner_text(timeout=15000))
     mapping=label_value_map(page)
     event_id=extract_event_id(url,mapping,text)
-    # The visible page heading is the authoritative opportunity title (e.g. RFP828 - ...).
     title=''
-    for sel in ['h1','h2','h3','.page-title','.event-title']:
+    for sel in ['h1','h2','.page-title','.event-title']:
         try:
-            candidates=page.locator(sel).all_inner_texts()
-            for candidate in candidates:
-                candidate=clean(candidate)
-                if re.match(r'^(RFP|RFQ|RFI|ITB|IFB|RFx)\s*[-#:]?\s*\w+', candidate, re.I):
-                    title=candidate
-                    break
+            title=clean(page.locator(sel).first.inner_text(timeout=1500))
             if title: break
         except Exception: pass
-    if not title:
-        # Registry page sometimes renders the title as a non-heading element.
-        m=re.search(r'((?:RFP|RFQ|RFI|ITB|IFB)\s*\d+\s*[-:–—]\s*[^\n]{4,220}?)(?=\s+Start Date:|\s+End Date:|\s+Event Details)', text, re.I)
-        if m: title=clean(m.group(1))
-    if not title:
-        title=first_match(mapping,'eventtitle','opportunitytitle','solicitationtitle','title')
-        agency=first_match(mapping,'agency','governmententity','entityname','agencyname')
+    if not title or title.lower() in {'event', 'announcement', 'event details'}:
+        # Some GPR layouts expose only a generic heading; recover the solicitation title from page text.
+        m=re.search(r'((?:RFP|RFQ|RFI|ITB|IFB|PE[- ]?)\s*[^\n]{4,180}?)(?=\s+Start Date:|\s+End Date:|\s+Event Details)', text, re.I)
+        if not m:
+            m=re.search(r'^(.*?)\s+(?:Start Date:|Event Details)',text,re.I)
+        title=clean(m.group(1)) if m else ''
+    agency=first_match(mapping,'agency','governmententity','entityname','agencyname')
     if not agency:
         m=re.search(r'\b\d{5}\s+([A-Z][A-Z0-9 ,&().\-/]+?)(?:\s+Buyer Contact:|\s+Description)',text)
         if m: agency=clean(m.group(1))
@@ -286,25 +277,10 @@ def scrape_details(page, url, keywords):
     category=first_match(mapping,'categorytype','category','purchasetype','eventtype')
     event_type=first_match(mapping,'eventtype','type of response','response type')
     address=first_match(mapping,'address','buyeraddress','contactaddress')
-    # The registry labels the external buyer's opportunity page as the Agency Site 'Link'.
-    agency_site_url=''
-    try:
-        for a in page.locator('a[href]').all():
-            label=clean(a.inner_text(timeout=500))
-            href=a.get_attribute('href') or ''
-            if label.lower() == 'link' and href and 'eventdetails' not in href.lower():
-                agency_site_url=urljoin(page.url, href)
-                break
-    except Exception: pass
-    # Explicitly extract the visible countdown shown beside the end date.
-    days_until=''
-    dm=re.search(r'Ends In:\s*(\d+)\s*days?', text, re.I)
-    if dm: days_until=dm.group(1)
-    event_id=event_id or ''
     return {
       'Opportunity ID':event_id or hashlib.sha1(url.encode()).hexdigest()[:12].upper(), 'Date Found':'', 'State':'Georgia',
       'Agency':agency,'Opportunity Title':title,'Solicitation / Reference No.':event_id,'Opportunity Type':event_type or category,
-      'Service Category':category,'Official Source URL':url,'Agency Site URL':agency_site_url,'Event ID':event_id,'Published Date':pub,'Deadline Date':end,'Deadline Time / Time Zone':end,'Days Until Deadline':days_until,
+      'Service Category':category,'Official Source URL':url,'Published Date':pub,'Deadline Date':end,'Deadline Time / Time Zone':end,
       'Estimated Value (if published)':value,'Scope Summary':(desc[:3500] + ('\nEvent details: '+url+'#pane-eventDetails\nDocuments: '+url+'#pane-documents') if desc else 'Event details: '+url+'#pane-eventDetails\nDocuments: '+url+'#pane-documents'), 'Eligibility / Mandatory Requirements':'',
       'Required Certifications / Experience':'','Contract Duration / Options':'','Incumbent / Prior Award (verified only)':'',
       'Healthcare IT Fit (0-25)':'','Eligibility & Compliance (0-20)':'','Customer / Contract Fit (0-15)':'',
@@ -396,8 +372,6 @@ def main():
                 row=scrape_details(page,item['url'],item['keywords'])
                 oid=clean(row['Opportunity ID'])
                 prior=old_by_id.get(oid,{})
-                if not prior:
-                    prior=next((old for old in old_tracker if clean(old.get('Official Source URL','')).split('#')[0] == clean(item['url']).split('#')[0]), {})
                 row['Date Found']=prior.get('Date Found') or datetime.now().strftime('%Y-%m-%d')
                 row['First Seen Date']=prior.get('First Seen Date') or row['Date Found']
                 row['Last Seen Date']=datetime.now().strftime('%Y-%m-%d')
@@ -430,22 +404,16 @@ def main():
     if lead_records:
         added,updated=upsert_sheet(tracker,tracker_headers,lead_records)
         logging.info('Tracker sync: %s added, %s updated',added,updated)
-    else:
-        logging.info('Tracker sync: no records passed completeness checks; records will be written to Manual Review')
     if review_records:
         mapped=[{h:r.get(h,'') for h in review_headers} for r in review_records]
         ra,ru=upsert_sheet(review,review_headers,mapped)
         logging.info('Manual review sync: %s added, %s updated',ra,ru)
-    else:
-        logging.info('Manual review sync: no records to add/update')
     diagnostics={'run_at':datetime.now(timezone.utc).isoformat(),'keywords_total':len(KEYWORDS),'unique_events_discovered':len(found),
       'details_attempted':len(urls) if 'urls' in locals() else 0,'records_scraped':len(records),'tracker_records':len(lead_records),
       'manual_review_records':len(review_records),'search_failures':failures,'tracker_gid':TRACKER_GID,'review_gid':REVIEW_GID,'max_details_per_run':MAX_DETAILS}
     _, tracker_snapshot = rows_as_dicts(tracker)
     _, review_snapshot = rows_as_dicts(review)
     export_data(tracker_snapshot, review_snapshot, diagnostics)
-    for filename in ['data/georgia_leads.csv','data/georgia_leads.json','data/georgia_manual_review.csv','data/georgia_manual_review.json','data/georgia_diagnostics.json']:
-        logging.info('Data export ready: %s (%s bytes)', filename, os.path.getsize(filename))
     logging.info('Diagnostics: %s',json.dumps(diagnostics))
     if not found and not records:
         raise RuntimeError('No event-detail links were found and no existing events could be refreshed. Inspect data/gpr_debug.txt and data/gpr_debug.html from the workflow artifact.')
