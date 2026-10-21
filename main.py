@@ -27,7 +27,7 @@ KEYWORDS = [
 
 TRACKER_HEADERS = [
 'Opportunity ID','Date Found','State','Agency','Opportunity Title','Solicitation / Reference No.','Opportunity Type','Service Category',
-'Official Source URL','Agency Site URL','Event ID','Published Date','Deadline Date','Deadline Time / Time Zone','Days Until Deadline','Estimated Value (if published)','Scope Summary',
+'Official Source URL','Agency Site URL','Event ID','Event Type','Event Status','Purchase Type','Category Type','Government Type','Fiscal Year','Published Date','Deadline Date','Deadline Time / Time Zone','Days Until Deadline','Estimated Value (if published)','Scope Summary',
 'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)',
 'Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)','Customer / Contract Fit (0-15)','Delivery Capability (0-15)',
 'Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)','Information Completeness (0-5)','Total Score (0-100)',
@@ -37,7 +37,7 @@ TRACKER_HEADERS = [
 'Contact Extraction Status','Last Updated At','Record Hash'
 ]
 REVIEW_HEADERS = ['Opportunity ID','Date Added to Review','State','Agency','Opportunity Title','Solicitation / Reference No.','Event Status',
-'Official Source URL','Agency Site URL','Event ID','Published Date','Deadline Date','Deadline Time / Time Zone','Days Until Deadline','Estimated Value (if published)','Scope Summary',
+'Official Source URL','Agency Site URL','Event ID','Event Type','Event Status','Purchase Type','Category Type','Government Type','Fiscal Year','Published Date','Deadline Date','Deadline Time / Time Zone','Days Until Deadline','Estimated Value (if published)','Scope Summary',
 'Eligibility / Mandatory Requirements','Required Certifications / Experience','Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)',
 'Customer / Contract Fit (0-15)','Delivery Capability (0-15)','Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)',
 'Information Completeness (0-5)','Total Score (0-100)','Mandatory Gate (Pass / Fail / Unknown)','Recommendation (Go / Investigate / No-Go)',
@@ -231,19 +231,25 @@ def scrape_details(page, url, keywords):
     text=clean(page.locator('body').inner_text(timeout=15000))
     mapping=label_value_map(page)
     event_id=extract_event_id(url,mapping,text)
+    # The visible page heading is the authoritative opportunity title (e.g. RFP828 - ...).
     title=''
-    for sel in ['h1','h2','h3','.page-title','.event-title','strong']:
+    for sel in ['h1','h2','h3','.page-title','.event-title']:
         try:
-            title=clean(page.locator(sel).first.inner_text(timeout=1500))
+            candidates=page.locator(sel).all_inner_texts()
+            for candidate in candidates:
+                candidate=clean(candidate)
+                if re.match(r'^(RFP|RFQ|RFI|ITB|IFB|RFx)\\s*[-#:]?\\s*\\w+', candidate, re.I):
+                    title=candidate
+                    break
             if title: break
         except Exception: pass
-    if not title or title.lower() in {'event', 'announcement', 'event details'}:
-        # Some GPR layouts expose only a generic heading; recover the solicitation title from page text.
-        m=re.search(r'((?:RFP|RFQ|RFI|ITB|IFB)\s*[^\n]{4,220}?)(?=\s+Start Date:|\s+End Date:|\s+Event Details)', text, re.I)
-        if not m:
-            m=re.search(r'^(.*?)\s+(?:Start Date:|Event Details)',text,re.I)
-        title=clean(m.group(1)) if m else ''
-    agency=first_match(mapping,'agency','governmententity','entityname','agencyname')
+    if not title:
+        # Registry page sometimes renders the title as a non-heading element.
+        m=re.search(r'((?:RFP|RFQ|RFI|ITB|IFB)\\s*\\d+\\s*[-:–—]\\s*[^\\n]{4,220}?)(?=\\s+Start Date:|\\s+End Date:|\\s+Event Details)', text, re.I)
+        if m: title=clean(m.group(1))
+    if not title:
+        title=first_match(mapping,'eventtitle','opportunitytitle','solicitationtitle','title')
+        agency=first_match(mapping,'agency','governmententity','entityname','agencyname')
     if not agency:
         m=re.search(r'\b\d{5}\s+([A-Z][A-Z0-9 ,&().\-/]+?)(?:\s+Buyer Contact:|\s+Description)',text)
         if m: agency=clean(m.group(1))
@@ -387,6 +393,8 @@ def main():
                 row=scrape_details(page,item['url'],item['keywords'])
                 oid=clean(row['Opportunity ID'])
                 prior=old_by_id.get(oid,{})
+                if not prior:
+                    prior=next((old for old in old_tracker if clean(old.get('Official Source URL','')).split('#')[0] == clean(item['url']).split('#')[0]), {})
                 row['Date Found']=prior.get('Date Found') or datetime.now().strftime('%Y-%m-%d')
                 row['First Seen Date']=prior.get('First Seen Date') or row['Date Found']
                 row['Last Seen Date']=datetime.now().strftime('%Y-%m-%d')
@@ -394,12 +402,12 @@ def main():
                 for col in ['Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)','Customer / Contract Fit (0-15)','Delivery Capability (0-15)',
                     'Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)','Information Completeness (0-5)','Total Score (0-100)',
                     'Mandatory Gate (Pass / Fail / Unknown)','Recommendation (Go / Investigate / No-Go)','Fit Rationale','Risks / Gaps','Next Action','Owner','Review Status','Reviewer Notes',
-                    'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)','Agency Site URL','Event ID','Days Until Deadline']:
+                    'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)']:
                     if clean(prior.get(col,'')) and not clean(row.get(col,'')): row[col]=prior[col]
                 for col in ['Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)','Customer / Contract Fit (0-15)','Delivery Capability (0-15)',
                     'Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)','Information Completeness (0-5)','Total Score (0-100)',
                     'Mandatory Gate (Pass / Fail / Unknown)','Recommendation (Go / Investigate / No-Go)','Fit Rationale','Risks / Gaps','Next Action','Owner','Review Status','Reviewer Notes',
-                    'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)','Agency Site URL','Event ID','Days Until Deadline']:
+                    'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)']:
                     if clean(prior.get(col,'')): row[col]=prior[col]
                 row['Record Hash']=hash_record(row)
                 records.append(row)
