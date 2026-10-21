@@ -1,17 +1,12 @@
 {
-  "run_at": "2026-10-21T13:22:05.323817+00:00",
+  "run_at": "2026-10-21T13:50:38.026846+00:00",
   "keywords_total": 26,
   "unique_events_discovered": 1,
   "details_attempted": 1,
-  "records_scraped": 0,
-  "tracker_records": 0,
+  "records_scraped": 1,
+  "tracker_records": 1,
   "manual_review_records": 0,
-  "search_failures": [
-    {
-      "url": "https://ssl.doas.state.ga.us/gpr/eventDetails?eSourceNumber=PE-29016-NONST-2027-000000075&sourceSystemType=gpr20",
-      "error": "cannot access local variable 'agency' where it is not associated with a value"
-    }
-  ],
+  "search_failures": [],
   "tracker_gid": 2125924989,
   "review_gid": 1667806659,
   "max_details_per_run": 200
