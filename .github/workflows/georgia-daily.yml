@@ -4,7 +4,6 @@ name: Georgia Procurement Tracker
 on:
   workflow_dispatch:
   schedule:
-    # 04:30 UTC = 10:00 AM IST every day
     - cron: '30 4 * * *'
 
 permissions:
@@ -12,6 +11,7 @@ permissions:
 
 jobs:
   run-tracker:
+    name: Run Georgia procurement tracker
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -25,6 +25,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: |
@@ -32,7 +34,7 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Ensure data folder exists
+      - name: Create data directory
         run: mkdir -p data
 
       - name: Run Georgia tracker
@@ -44,21 +46,23 @@ jobs:
           MAX_DETAILS_PER_RUN: '200'
           MAX_PAGES_PER_KEYWORD: '10'
           REQUEST_DELAY_SECONDS: '0.5'
+          PYTHONUNBUFFERED: '1'
         run: python -u main.py
 
-      - name: Show generated data files
+      - name: Display generated files and diagnostics
         if: always()
         run: |
-          echo "=== Data directory ==="
+          echo "===== Data directory ====="
           ls -lah data/ || true
-          echo "=== Diagnostics ==="
+
+          echo "===== Diagnostics ====="
           if [ -f data/georgia_diagnostics.json ]; then
             cat data/georgia_diagnostics.json
           else
-            echo "Diagnostics file was not generated."
+            echo "WARNING: diagnostics file was not generated"
           fi
 
-      - name: Upload data files as workflow artifacts
+      - name: Upload generated data artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -72,21 +76,16 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Commit generated data files
+      - name: Commit generated data to repository
         if: always()
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
-          git add -f \
-            data/georgia_leads.csv \
-            data/georgia_leads.json \
-            data/georgia_manual_review.csv \
-            data/georgia_manual_review.json \
-            data/georgia_diagnostics.json
+          git add -f data/ || true
 
           if git diff --cached --quiet; then
-            echo "No generated data changes to commit."
+            echo "No data changes to commit."
           else
             git commit -m "Update Georgia procurement data"
             git push origin HEAD:${GITHUB_REF_NAME}
