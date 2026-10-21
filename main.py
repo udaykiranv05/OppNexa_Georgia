@@ -27,7 +27,7 @@ KEYWORDS = [
 
 TRACKER_HEADERS = [
 'Opportunity ID','Date Found','State','Agency','Opportunity Title','Solicitation / Reference No.','Opportunity Type','Service Category',
-'Official Source URL','Published Date','Deadline Date','Deadline Time / Time Zone','Estimated Value (if published)','Scope Summary',
+'Official Source URL','Agency Site URL','Event ID','Published Date','Deadline Date','Deadline Time / Time Zone','Days Until Deadline','Estimated Value (if published)','Scope Summary',
 'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)',
 'Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)','Customer / Contract Fit (0-15)','Delivery Capability (0-15)',
 'Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)','Information Completeness (0-5)','Total Score (0-100)',
@@ -37,7 +37,7 @@ TRACKER_HEADERS = [
 'Contact Extraction Status','Last Updated At','Record Hash'
 ]
 REVIEW_HEADERS = ['Opportunity ID','Date Added to Review','State','Agency','Opportunity Title','Solicitation / Reference No.','Event Status',
-'Official Source URL','Published Date','Deadline Date','Deadline Time / Time Zone','Estimated Value (if published)','Scope Summary',
+'Official Source URL','Agency Site URL','Event ID','Published Date','Deadline Date','Deadline Time / Time Zone','Days Until Deadline','Estimated Value (if published)','Scope Summary',
 'Eligibility / Mandatory Requirements','Required Certifications / Experience','Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)',
 'Customer / Contract Fit (0-15)','Delivery Capability (0-15)','Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)',
 'Information Completeness (0-5)','Total Score (0-100)','Mandatory Gate (Pass / Fail / Unknown)','Recommendation (Go / Investigate / No-Go)',
@@ -232,14 +232,14 @@ def scrape_details(page, url, keywords):
     mapping=label_value_map(page)
     event_id=extract_event_id(url,mapping,text)
     title=''
-    for sel in ['h1','h2','.page-title','.event-title']:
+    for sel in ['h1','h2','h3','.page-title','.event-title','strong']:
         try:
             title=clean(page.locator(sel).first.inner_text(timeout=1500))
             if title: break
         except Exception: pass
     if not title or title.lower() in {'event', 'announcement', 'event details'}:
         # Some GPR layouts expose only a generic heading; recover the solicitation title from page text.
-        m=re.search(r'((?:RFP|RFQ|RFI|ITB|IFB|PE[- ]?)\s*[^\n]{4,180}?)(?=\s+Start Date:|\s+End Date:|\s+Event Details)', text, re.I)
+        m=re.search(r'((?:RFP|RFQ|RFI|ITB|IFB)\s*[^\n]{4,220}?)(?=\s+Start Date:|\s+End Date:|\s+Event Details)', text, re.I)
         if not m:
             m=re.search(r'^(.*?)\s+(?:Start Date:|Event Details)',text,re.I)
         title=clean(m.group(1)) if m else ''
@@ -277,10 +277,25 @@ def scrape_details(page, url, keywords):
     category=first_match(mapping,'categorytype','category','purchasetype','eventtype')
     event_type=first_match(mapping,'eventtype','type of response','response type')
     address=first_match(mapping,'address','buyeraddress','contactaddress')
+    # The registry labels the external buyer's opportunity page as the Agency Site 'Link'.
+    agency_site_url=''
+    try:
+        for a in page.locator('a[href]').all():
+            label=clean(a.inner_text(timeout=500))
+            href=a.get_attribute('href') or ''
+            if label.lower() == 'link' and href and 'eventdetails' not in href.lower():
+                agency_site_url=urljoin(page.url, href)
+                break
+    except Exception: pass
+    # Explicitly extract the visible countdown shown beside the end date.
+    days_until=''
+    dm=re.search(r'Ends In:\s*(\d+)\s*days?', text, re.I)
+    if dm: days_until=dm.group(1)
+    event_id=event_id or ''
     return {
       'Opportunity ID':event_id or hashlib.sha1(url.encode()).hexdigest()[:12].upper(), 'Date Found':'', 'State':'Georgia',
       'Agency':agency,'Opportunity Title':title,'Solicitation / Reference No.':event_id,'Opportunity Type':event_type or category,
-      'Service Category':category,'Official Source URL':url,'Published Date':pub,'Deadline Date':end,'Deadline Time / Time Zone':end,
+      'Service Category':category,'Official Source URL':url,'Agency Site URL':agency_site_url,'Event ID':event_id,'Published Date':pub,'Deadline Date':end,'Deadline Time / Time Zone':end,'Days Until Deadline':days_until,
       'Estimated Value (if published)':value,'Scope Summary':(desc[:3500] + ('\nEvent details: '+url+'#pane-eventDetails\nDocuments: '+url+'#pane-documents') if desc else 'Event details: '+url+'#pane-eventDetails\nDocuments: '+url+'#pane-documents'), 'Eligibility / Mandatory Requirements':'',
       'Required Certifications / Experience':'','Contract Duration / Options':'','Incumbent / Prior Award (verified only)':'',
       'Healthcare IT Fit (0-25)':'','Eligibility & Compliance (0-20)':'','Customer / Contract Fit (0-15)':'',
@@ -379,12 +394,12 @@ def main():
                 for col in ['Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)','Customer / Contract Fit (0-15)','Delivery Capability (0-15)',
                     'Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)','Information Completeness (0-5)','Total Score (0-100)',
                     'Mandatory Gate (Pass / Fail / Unknown)','Recommendation (Go / Investigate / No-Go)','Fit Rationale','Risks / Gaps','Next Action','Owner','Review Status','Reviewer Notes',
-                    'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)']:
+                    'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)','Agency Site URL','Event ID','Days Until Deadline']:
                     if clean(prior.get(col,'')) and not clean(row.get(col,'')): row[col]=prior[col]
                 for col in ['Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)','Customer / Contract Fit (0-15)','Delivery Capability (0-15)',
                     'Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)','Information Completeness (0-5)','Total Score (0-100)',
                     'Mandatory Gate (Pass / Fail / Unknown)','Recommendation (Go / Investigate / No-Go)','Fit Rationale','Risks / Gaps','Next Action','Owner','Review Status','Reviewer Notes',
-                    'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)']:
+                    'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)','Agency Site URL','Event ID','Days Until Deadline']:
                     if clean(prior.get(col,'')): row[col]=prior[col]
                 row['Record Hash']=hash_record(row)
                 records.append(row)
