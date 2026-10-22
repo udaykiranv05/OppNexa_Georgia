@@ -164,19 +164,43 @@ def upsert_sheet(ws, headers, records, key='Opportunity ID'):
     return appended, updated
 
 def label_value_map(page):
-    pairs={}
-    # Capture common label/value tables and definition lists.
+    """Extract label/value pairs without joining unrelated labels and values."""
+    pairs = {}
+    known_labels = {
+        'event id', 'event number', 'esource number', 'event title', 'opportunity title',
+        'solicitation number', 'reference number', 'agency', 'entity', 'government entity',
+        'event type', 'event status', 'purchase type', 'category type', 'government type',
+        'fiscal year', 'start date', 'end date', 'closing date', 'deadline date',
+        'description', 'event description', 'buyer contact', 'contact name', 'email',
+        'contact email', 'phone', 'telephone', 'address', 'estimated value',
+        'posted date', 'publish date', 'created date', 'date posted', 'ends in'
+    }
     for tr in page.locator('tr').all():
         try:
-            cells=tr.locator('th,td').all_inner_texts()
-            cells=[clean(x) for x in cells if clean(x)]
-            if len(cells)>=2: pairs[cells[0].rstrip(':')]= ' | '.join(cells[1:])
-        except Exception: pass
+            cells = [clean(x).rstrip(':') for x in tr.locator('th,td').all_inner_texts()]
+            cells = [x for x in cells if x]
+            # Registry pages may place several label/value pairs in one table row.
+            i = 0
+            while i + 1 < len(cells):
+                label = cells[i].strip()
+                if norm(label) in {norm(x) for x in known_labels}:
+                    pairs[label] = cells[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            # Keep a conservative fallback only when a row is a simple 2-cell pair.
+            if len(cells) == 2 and norm(cells[0]) not in {norm(x) for x in known_labels}:
+                pairs.setdefault(cells[0], cells[1])
+        except Exception:
+            pass
     for dt in page.locator('dt').all():
         try:
-            key=clean(dt.inner_text()).rstrip(':'); val=clean(dt.locator('xpath=following-sibling::*[1]').inner_text())
-            if key and val: pairs[key]=val
-        except Exception: pass
+            key = clean(dt.inner_text()).rstrip(':')
+            val = clean(dt.locator('xpath=following-sibling::*[1]').inner_text())
+            if key and val:
+                pairs[key] = val
+        except Exception:
+            pass
     return pairs
 
 def first_match(mapping, *terms):
@@ -193,10 +217,10 @@ def extract_event_id(url, mapping, text):
     for key, value in mapping.items():
         if norm(key) in {'eventid', 'eventnumber', 'esourcenumber'}:
             candidate = clean(value)
-            match = re.search(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\b', candidate, re.I)
+            match = re.search(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\\b', candidate, re.I)
             if match:
                 return match.group(0)
-    match = re.search(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\b', text, re.I)
+    match = re.search(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\\b', text, re.I)
     return match.group(0) if match else ''
 
 def scrape_search_keyword(page, keyword):
@@ -254,50 +278,90 @@ def scrape_search_keyword(page, keyword):
     return found
 
 def text_label_value(text, label, stop_labels):
-    """Extract a single value from flattened visible page text using neighboring labels."""
-    stops = "|".join(re.escape(x) for x in stop_labels)
-    pattern = rf"(?:^|\s){re.escape(label)}\s*:?\s*(.*?)(?=\s+(?:{stops})\s*:?\s*|$)"
+    """Extract a value between a visible label and the next known label."""
+    stops = '|'.join(re.escape(x) for x in sorted(stop_labels, key=len, reverse=True))
+    pattern = rf'(?:^|\s){re.escape(label)}\s*:?\s*(.*?)(?=\s+(?:{stops})\s*:?\s*|$)'
     match = re.search(pattern, text, re.I)
     return clean(match.group(1)) if match else ''
 
+
 def extract_event_metadata(text, url, mapping):
-    # These labels appear together in the registry's event-detail table; table row
-    # aggregation can mistakenly pair one label with the next label, so parse text too.
     labels = [
         'Event Type', 'Event Status', 'Purchase Type', 'Category Type',
         'Government Type', 'Fiscal Year', 'Start Date', 'End Date',
-        'Buyer Contact', 'Description', 'Agency', 'Entity'
+        'Buyer Contact', 'Description'
     ]
     result = {}
+    # Prefer exact label/value pairs from the DOM; flattened-text parsing is fallback.
+    aliases = {
+        'Event Type': ('eventtype',),
+        'Event Status': ('eventstatus',),
+        'Purchase Type': ('purchasetype',),
+        'Category Type': ('categorytype',),
+        'Government Type': ('governmenttype',),
+        'Fiscal Year': ('fiscalyear',),
+        'Start Date': ('startdate', 'eventstart'),
+        'End Date': ('enddate', 'closingdate', 'duedate', 'deadline'),
+        'Description': ('description', 'eventdescription', 'scope'),
+        'Buyer Contact': ('buyercontact', 'contactname', 'buyername')
+    }
     for label in labels:
-        stops = [x for x in labels if x != label]
-        result[label] = text_label_value(text, label, stops)
+        exact = ''
+        for key, value in mapping.items():
+            if norm(key) in aliases.get(label, ()):
+                exact = clean(value)
+                break
+        result[label] = exact or text_label_value(text, label, labels + ['Ends In', 'Event Details', 'Documents', 'Link'])
 
-    # Event status is usually a single word like Open / Closed / Awarded.
-    status_match = re.search(r'\bEvent Status\s*:?[ \t]*(Open|Closed|Cancelled|Canceled|Awarded|Evaluated|Pending|Draft)\b', text, re.I)
+    status_match = re.search(
+        r'\bEvent Status\s*:?\s*(Open|Closed|Cancelled|Canceled|Awarded|Evaluated|Pending|Draft)\b',
+        text, re.I
+    )
     if status_match:
         result['Event Status'] = status_match.group(1).title()
 
-    # Event ID comes from the URL query, never a generic "Event" table value.
     result['Event ID'] = extract_event_id(url, mapping, text)
 
-    # Event title is commonly shown before the Start Date.
+    # Titles are commonly displayed as "RFP828 - ...".
     title_match = re.search(
-        r'((?:RFP|RFQ|RFI|ITB|IFB|RFx)\s*[-#]?\s*[A-Z0-9][A-Z0-9-]*\s*[-:–—]\s*.+?)(?=\s+Start Date\s*:|\s+End Date\s*:|\s+Event Details\b)',
-        text, re.I)
+        r'\b((?:RFP|RFQ|RFI|ITB|IFB|RFx)\s*[-#]?\s*[A-Z0-9][A-Z0-9-]*\s*[-:–—]\s*.+?)(?=\s+Start Date\s*:|\s+End Date\s*:|\s+Event Details\b)',
+        text, re.I
+    )
     if title_match:
         result['Opportunity Title'] = clean(title_match.group(1))
 
-    # The agency name is visible around the Event ID / Buyer Contact section.
-    agency_match = re.search(
-        r'\b' + re.escape(result['Event ID']) + r'\s+(.+?)(?=\s+Buyer Contact\s*:|\s+Description\s*:|\s+Event Type\s*:)',
-        text, re.I) if result['Event ID'] else None
-    if agency_match:
-        candidate = clean(agency_match.group(1))
-        # Remove labels accidentally included by flattened layout.
-        candidate = re.split(r'\s+(?:Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year)\b', candidate, flags=re.I)[0]
-        if candidate and len(candidate) < 180:
-            result['Agency'] = candidate
+    # Prefer a direct Agency/Entity label if it contains a clean value.
+    agency = ''
+    for key, value in mapping.items():
+        if norm(key) in {'agency', 'agencyname', 'entity', 'entityname', 'governmententity'}:
+            candidate = clean(value)
+            candidate = re.sub(r'^\d{5}\s+', '', candidate)
+            if candidate and len(candidate) < 180 and not re.search(
+                r'\b(Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year|Link)\b',
+                candidate, re.I
+            ) and ' | ' not in candidate:
+                agency = candidate
+                break
+    # On this registry layout the agency often follows a 5-digit entity code.
+    if not agency:
+        entity_match = re.search(
+            r'\b\d{5}\s+(ATLANTA REGIONAL COMMISSION|[A-Z][A-Z0-9&.,() /\'-]{2,100}?)(?=\s+(?:Buyer Contact|Description|Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year|Link)\b)',
+            text, re.I
+        )
+        if entity_match:
+            agency = clean(entity_match.group(1))
+    if not agency:
+        # Fallback: stop the uppercase agency name at the next known registry label.
+        entity_match = re.search(
+            r'\b\d{5}\s+([A-Z][A-Z0-9&.,() /\'-]{2,100}?)(?=\s+(?:RFP|RFQ|RFI|ITB|IFB|RFx)\b|\s+Buyer Contact\b|\s+Description\b|$)',
+            text, re.I
+        )
+        if entity_match:
+            candidate = clean(entity_match.group(1))
+            if not re.search(r'\b(Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year|Link)\b', candidate, re.I):
+                agency = candidate
+    if agency:
+        result['Agency'] = agency
     return result
 
 def scrape_details(page, url, keywords):
@@ -329,10 +393,17 @@ def scrape_details(page, url, keywords):
         title=first_match(mapping,'eventtitle','opportunitytitle','solicitationtitle','title')
     # Always initialize agency independently of title extraction.
     agency=metadata.get('Agency','') or first_match(mapping,'agency','governmententity','entityname','agencyname')
+    if re.search(r'\b(Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year)\b', agency, re.I) or ' | ' in agency:
+        agency = ''
     if not agency:
         m=re.search(r'\b\d{5}\s+([A-Z][A-Z0-9 ,&().\-/]+?)(?:\s+Buyer Contact:|\s+Description)',text)
         if m: agency=clean(m.group(1))
-    status=metadata.get('Event Status','') or first_match(mapping,'eventstatus','status')
+    status=metadata.get('Event Status','')
+    if status.lower() not in {'open','closed','cancelled','canceled','awarded','evaluated','pending','draft'}:
+        status = ''
+    if not status:
+        status_match = re.search(r'\bEvent Status\s*:?\s*(Open|Closed|Cancelled|Canceled|Awarded|Evaluated|Pending|Draft)\b', text, re.I)
+        status = status_match.group(1).title() if status_match else ''
     purchase_type=metadata.get('Purchase Type','') or first_match(mapping,'purchasetype')
     category_type=metadata.get('Category Type','') or first_match(mapping,'categorytype')
     government_type=metadata.get('Government Type','') or first_match(mapping,'governmenttype')
@@ -348,7 +419,7 @@ def scrape_details(page, url, keywords):
     if start_match: start=clean(start_match.group(1))
     if end_match: end=clean(end_match.group(1))
     if not end:
-        m=re.search(r'(?:End Date|Closing Date|Deadline Date)[: ]+([^\n]{5,100})', text, re.I)
+        m=re.search(r'(?:End Date|Closing Date|Deadline Date)[: ]+([^\\n]{5,100})', text, re.I)
         if m: end=clean(m.group(1))
     contact_name=first_match(mapping,'buyercontact','contactname','buyername')
     if not contact_name:
@@ -370,12 +441,12 @@ def scrape_details(page, url, keywords):
     category=category_type or first_match(mapping,'category','purchasetype','eventtype')
     event_type=event_type or first_match(mapping,'type of response','response type')
     address=first_match(mapping,'address','buyeraddress','contactaddress')
-    # Prefer a specific external procurement page over generic agency/opportunities indexes.
+    # Prefer event-specific external links; do not store a generic opportunities index.
     agency_site_url = ''
     try:
-        anchors = []
+        candidates = []
         ref_slug = re.sub(r'[^a-z0-9]+', '-', solicitation_ref.lower()).strip('-')
-        title_slug = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
+        title_words = [w for w in re.findall(r'[a-z0-9]+', title.lower()) if len(w) >= 5]
         for a in page.locator('a[href]').all():
             label = clean(a.inner_text(timeout=500))
             href = (a.get_attribute('href') or '').strip()
@@ -385,23 +456,19 @@ def scrape_details(page, url, keywords):
             parsed = urlparse(absolute)
             if parsed.scheme not in {'http', 'https'}:
                 continue
-            # Ignore generic home/list pages unless no event-specific link exists.
             path = parsed.path.rstrip('/').lower()
-            generic = path in {'', '/', '/opportunities', '/procurement/opportunities', '/gpr'}
-            haystack = (label + ' ' + href).lower()
-            score = 0
-            if ref_slug and ref_slug in re.sub(r'[^a-z0-9]+', '-', haystack):
+            if path in {'', '/', '/opportunities', '/procurement/opportunities', '/gpr'}:
+                continue
+            searchable = (label + ' ' + href).lower()
+            score = 3
+            if ref_slug and ref_slug in re.sub(r'[^a-z0-9]+', '-', searchable):
                 score += 10
-            if title_slug and any(part in haystack for part in title_slug.split('-') if len(part) >= 5):
-                score += 2
-            if label.lower() in {'link', 'view opportunity', 'solicitation details', 'procurement opportunity'}:
+            score += sum(2 for word in title_words if word in searchable)
+            if label.lower() in {'link', 'view opportunity', 'solicitation details'}:
                 score += 1
-            if not generic:
-                score += 3
-            anchors.append((score, generic, absolute))
-        specific = [x for x in anchors if not x[1]]
-        if specific:
-            agency_site_url = max(specific, key=lambda x: x[0])[2]
+            candidates.append((score, absolute))
+        if candidates:
+            agency_site_url = max(candidates, key=lambda x: x[0])[1]
     except Exception:
         logging.exception('Could not extract agency-specific opportunity URL')
 
