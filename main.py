@@ -22,7 +22,7 @@ KEYWORDS = [
 'Medicaid Management Information System','Public Health Information System','Healthcare Analytics','Healthcare Interoperability',
 'Application Development','Application Modernization','Data Integration','API Integration','Cloud Migration',
 'Managed Security Services','Healthcare Cybersecurity','IT Staff Augmentation','Artificial Intelligence','Machine Learning',
-'Texas Health and Human Services Commission','Texas Department of State Health Services','Texas Medicaid','Integrated Eligibility'
+'Integrated Eligibility'
 ]
 
 TRACKER_HEADERS = [
@@ -193,10 +193,10 @@ def extract_event_id(url, mapping, text):
     for key, value in mapping.items():
         if norm(key) in {'eventid', 'eventnumber', 'esourcenumber'}:
             candidate = clean(value)
-            match = re.search(r'\\b[A-Z]{2}-[A-Z0-9-]{8,}\\b', candidate, re.I)
+            match = re.search(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\b', candidate, re.I)
             if match:
                 return match.group(0)
-    match = re.search(r'\\b[A-Z]{2}-[A-Z0-9-]{8,}\\b', text, re.I)
+    match = re.search(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\b', text, re.I)
     return match.group(0) if match else ''
 
 def scrape_search_keyword(page, keyword):
@@ -256,7 +256,7 @@ def scrape_search_keyword(page, keyword):
 def text_label_value(text, label, stop_labels):
     """Extract a single value from flattened visible page text using neighboring labels."""
     stops = "|".join(re.escape(x) for x in stop_labels)
-    pattern = rf"(?:^|\\s){re.escape(label)}\\s*:?\\s*(.*?)(?=\\s+(?:{stops})\\s*:?\\s*|$)"
+    pattern = rf"(?:^|\s){re.escape(label)}\s*:?\s*(.*?)(?=\s+(?:{stops})\s*:?\s*|$)"
     match = re.search(pattern, text, re.I)
     return clean(match.group(1)) if match else ''
 
@@ -274,7 +274,7 @@ def extract_event_metadata(text, url, mapping):
         result[label] = text_label_value(text, label, stops)
 
     # Event status is usually a single word like Open / Closed / Awarded.
-    status_match = re.search(r'\\bEvent Status\\s*:?[ \\t]*(Open|Closed|Cancelled|Canceled|Awarded|Evaluated|Pending|Draft)\\b', text, re.I)
+    status_match = re.search(r'\bEvent Status\s*:?[ \t]*(Open|Closed|Cancelled|Canceled|Awarded|Evaluated|Pending|Draft)\b', text, re.I)
     if status_match:
         result['Event Status'] = status_match.group(1).title()
 
@@ -283,19 +283,19 @@ def extract_event_metadata(text, url, mapping):
 
     # Event title is commonly shown before the Start Date.
     title_match = re.search(
-        r'((?:RFP|RFQ|RFI|ITB|IFB|RFx)\\s*[-#]?\\s*[A-Z0-9][A-Z0-9-]*\\s*[-:–—]\\s*.+?)(?=\\s+Start Date\\s*:|\\s+End Date\\s*:|\\s+Event Details\\b)',
+        r'((?:RFP|RFQ|RFI|ITB|IFB|RFx)\s*[-#]?\s*[A-Z0-9][A-Z0-9-]*\s*[-:–—]\s*.+?)(?=\s+Start Date\s*:|\s+End Date\s*:|\s+Event Details\b)',
         text, re.I)
     if title_match:
         result['Opportunity Title'] = clean(title_match.group(1))
 
     # The agency name is visible around the Event ID / Buyer Contact section.
     agency_match = re.search(
-        r'\\b' + re.escape(result['Event ID']) + r'\\s+(.+?)(?=\\s+Buyer Contact\\s*:|\\s+Description\\s*:|\\s+Event Type\\s*:)',
+        r'\b' + re.escape(result['Event ID']) + r'\s+(.+?)(?=\s+Buyer Contact\s*:|\s+Description\s*:|\s+Event Type\s*:)',
         text, re.I) if result['Event ID'] else None
     if agency_match:
         candidate = clean(agency_match.group(1))
         # Remove labels accidentally included by flattened layout.
-        candidate = re.split(r'\\s+(?:Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year)\\b', candidate, flags=re.I)[0]
+        candidate = re.split(r'\s+(?:Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year)\b', candidate, flags=re.I)[0]
         if candidate and len(candidate) < 180:
             result['Agency'] = candidate
     return result
@@ -348,7 +348,7 @@ def scrape_details(page, url, keywords):
     if start_match: start=clean(start_match.group(1))
     if end_match: end=clean(end_match.group(1))
     if not end:
-        m=re.search(r'(?:End Date|Closing Date|Deadline Date)[: ]+([^\\n]{5,100})', text, re.I)
+        m=re.search(r'(?:End Date|Closing Date|Deadline Date)[: ]+([^\n]{5,100})', text, re.I)
         if m: end=clean(m.group(1))
     contact_name=first_match(mapping,'buyercontact','contactname','buyername')
     if not contact_name:
@@ -370,23 +370,48 @@ def scrape_details(page, url, keywords):
     category=category_type or first_match(mapping,'category','purchasetype','eventtype')
     event_type=event_type or first_match(mapping,'type of response','response type')
     address=first_match(mapping,'address','buyeraddress','contactaddress')
-    # The registry labels the external buyer's opportunity page as the Agency Site 'Link'.
-    agency_site_url=''
+    # Prefer a specific external procurement page over generic agency/opportunities indexes.
+    agency_site_url = ''
     try:
+        anchors = []
+        ref_slug = re.sub(r'[^a-z0-9]+', '-', solicitation_ref.lower()).strip('-')
+        title_slug = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
         for a in page.locator('a[href]').all():
-            label=clean(a.inner_text(timeout=500))
-            href=a.get_attribute('href') or ''
-            if label.lower() == 'link' and href and 'eventdetails' not in href.lower():
-                agency_site_url=urljoin(page.url, href)
-                break
-    except Exception: pass
+            label = clean(a.inner_text(timeout=500))
+            href = (a.get_attribute('href') or '').strip()
+            if not href or href.startswith(('#', 'javascript:')) or 'eventdetails' in href.lower():
+                continue
+            absolute = urljoin(page.url, href)
+            parsed = urlparse(absolute)
+            if parsed.scheme not in {'http', 'https'}:
+                continue
+            # Ignore generic home/list pages unless no event-specific link exists.
+            path = parsed.path.rstrip('/').lower()
+            generic = path in {'', '/', '/opportunities', '/procurement/opportunities', '/gpr'}
+            haystack = (label + ' ' + href).lower()
+            score = 0
+            if ref_slug and ref_slug in re.sub(r'[^a-z0-9]+', '-', haystack):
+                score += 10
+            if title_slug and any(part in haystack for part in title_slug.split('-') if len(part) >= 5):
+                score += 2
+            if label.lower() in {'link', 'view opportunity', 'solicitation details', 'procurement opportunity'}:
+                score += 1
+            if not generic:
+                score += 3
+            anchors.append((score, generic, absolute))
+        specific = [x for x in anchors if not x[1]]
+        if specific:
+            agency_site_url = max(specific, key=lambda x: x[0])[2]
+    except Exception:
+        logging.exception('Could not extract agency-specific opportunity URL')
+
     # Explicitly extract the visible countdown shown beside the end date.
     days_until=''
     dm=re.search(r'Ends In:\s*(\d+)\s*days?', text, re.I)
     if dm:
         days_until=dm.group(1)
     if not days_until and end:
-        date_match = re.search(r'(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2},?\\s+20\\d{2}', end, re.I)
+        date_match = re.search(r'(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+20\d{2}', end, re.I)
         if date_match:
             try:
                 deadline_dt = datetime.strptime(date_match.group(0).replace(',', ''), '%b %d %Y')
