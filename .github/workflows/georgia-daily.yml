@@ -13,6 +13,7 @@ jobs:
     name: Run Georgia procurement tracker
     runs-on: ubuntu-latest
     timeout-minutes: 45
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,7 +33,7 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Ensure data directory exists
+      - name: Create data directory
         run: mkdir -p data
 
       - name: Run Georgia tracker
@@ -47,13 +48,17 @@ jobs:
           PYTHONUNBUFFERED: '1'
         run: python -u main.py
 
-      - name: Show generated files
+      - name: Display generated files and diagnostics
         if: always()
         run: |
-          echo '=== data directory ==='
+          echo "===== Data directory ====="
           ls -lah data/ || true
-          echo '=== diagnostics ==='
-          if [ -f data/georgia_diagnostics.json ]; then cat data/georgia_diagnostics.json; else echo 'Diagnostics not generated'; fi
+          echo "===== Diagnostics ====="
+          if [ -f data/georgia_diagnostics.json ]; then
+            cat data/georgia_diagnostics.json
+          else
+            echo "WARNING: diagnostics file was not generated"
+          fi
 
       - name: Upload generated data artifact
         if: always()
@@ -69,15 +74,15 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Commit generated data files
+      - name: Commit generated data to repository
         if: always()
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -f data/georgia_leads.csv data/georgia_leads.json data/georgia_manual_review.csv data/georgia_manual_review.json data/georgia_diagnostics.json 2>/dev/null || true
+          git add -f data/ || true
           if git diff --cached --quiet; then
-            echo 'No generated data changes to commit.'
+            echo "No data changes to commit."
           else
-            git commit -m 'Update Georgia procurement data'
-            git push origin "HEAD:${GITHUB_REF_NAME}"
+            git commit -m "Update Georgia procurement data"
+            git push origin HEAD:${GITHUB_REF_NAME}
           fi
