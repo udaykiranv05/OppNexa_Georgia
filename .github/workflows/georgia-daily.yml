@@ -8,12 +8,16 @@ on:
 permissions:
   contents: write
 
+# Prevent two scheduled/manual runs from pushing generated data simultaneously.
+concurrency:
+  group: georgia-procurement-tracker-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   run-tracker:
     name: Run Georgia procurement tracker
     runs-on: ubuntu-latest
     timeout-minutes: 45
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,7 +37,7 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Create data directory
+      - name: Ensure data directory exists
         run: mkdir -p data
 
       - name: Run Georgia tracker
@@ -48,17 +52,13 @@ jobs:
           PYTHONUNBUFFERED: '1'
         run: python -u main.py
 
-      - name: Display generated files and diagnostics
+      - name: Show generated files
         if: always()
         run: |
-          echo "===== Data directory ====="
+          echo '=== data directory ==='
           ls -lah data/ || true
-          echo "===== Diagnostics ====="
-          if [ -f data/georgia_diagnostics.json ]; then
-            cat data/georgia_diagnostics.json
-          else
-            echo "WARNING: diagnostics file was not generated"
-          fi
+          echo '=== diagnostics ==='
+          if [ -f data/georgia_diagnostics.json ]; then cat data/georgia_diagnostics.json; else echo 'Diagnostics not generated'; fi
 
       - name: Upload generated data artifact
         if: always()
@@ -74,15 +74,20 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Commit generated data to repository
-        if: always()
+      # Only commit outputs if the scraper and Sheets sync both completed successfully.
+      - name: Commit generated data files
+        if: success()
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -f data/ || true
+          git add -f data/georgia_leads.csv data/georgia_leads.json data/georgia_manual_review.csv data/georgia_manual_review.json data/georgia_diagnostics.json
+
           if git diff --cached --quiet; then
-            echo "No data changes to commit."
-          else
-            git commit -m "Update Georgia procurement data"
-            git push origin HEAD:${GITHUB_REF_NAME}
+            echo 'No generated data changes to commit.'
+            exit 0
           fi
+
+          git commit -m 'Update Georgia procurement data'
+          git fetch origin "$GITHUB_REF_NAME"
+          git rebase "origin/$GITHUB_REF_NAME"
+          git push origin "HEAD:$GITHUB_REF_NAME"
