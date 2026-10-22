@@ -164,50 +164,79 @@ def upsert_sheet(ws, headers, records, key='Opportunity ID'):
     return appended, updated
 
 def label_value_map(page):
-    """Extract label/value pairs without joining unrelated labels and values."""
+    """Extract only real label/value pairs; never treat the next label as a value."""
     pairs = {}
     known_labels = {
         'event id', 'event number', 'esource number', 'event title', 'opportunity title',
-        'solicitation number', 'reference number', 'agency', 'entity', 'government entity',
-        'event type', 'event status', 'purchase type', 'category type', 'government type',
-        'fiscal year', 'start date', 'end date', 'closing date', 'deadline date',
-        'description', 'event description', 'buyer contact', 'contact name', 'email',
-        'contact email', 'phone', 'telephone', 'address', 'estimated value',
-        'posted date', 'publish date', 'created date', 'date posted', 'ends in'
+        'solicitation number', 'reference number', 'agency', 'agency name', 'entity',
+        'entity name', 'government entity', 'event type', 'event status', 'purchase type',
+        'category type', 'government type', 'fiscal year', 'start date', 'end date',
+        'closing date', 'deadline date', 'description', 'event description', 'buyer contact',
+        'contact name', 'email', 'contact email', 'phone', 'telephone', 'address',
+        'estimated value', 'posted date', 'publish date', 'created date', 'date posted',
+        'ends in', 'link', 'event details', 'documents'
     }
+    known_norm = {norm(x) for x in known_labels}
+
+    def add(label, value):
+        label = clean(label).rstrip(':')
+        value = clean(value)
+        if not label or not value or norm(label) not in known_norm:
+            return
+        if norm(value.rstrip(':')) in known_norm:
+            return
+        pairs[label] = value
+
     for tr in page.locator('tr').all():
         try:
             cells = [clean(x).rstrip(':') for x in tr.locator('th,td').all_inner_texts()]
             cells = [x for x in cells if x]
-            # Registry pages may place several label/value pairs in one table row.
             i = 0
-            while i + 1 < len(cells):
-                label = cells[i].strip()
-                if norm(label) in {norm(x) for x in known_labels}:
-                    pairs[label] = cells[i + 1]
-                    i += 2
+            while i < len(cells):
+                if norm(cells[i]) in known_norm:
+                    if i + 1 < len(cells):
+                        add(cells[i], cells[i + 1])
+                        i += 2
+                    else:
+                        i += 1
                 else:
                     i += 1
-            # Keep a conservative fallback only when a row is a simple 2-cell pair.
-            if len(cells) == 2 and norm(cells[0]) not in {norm(x) for x in known_labels}:
-                pairs.setdefault(cells[0], cells[1])
         except Exception:
-            pass
+            continue
+
     for dt in page.locator('dt').all():
         try:
-            key = clean(dt.inner_text()).rstrip(':')
-            val = clean(dt.locator('xpath=following-sibling::*[1]').inner_text())
-            if key and val:
-                pairs[key] = val
+            add(dt.inner_text(), dt.locator('xpath=following-sibling::*[1]').inner_text())
         except Exception:
-            pass
+            continue
+
+    for label in page.locator('label').all():
+        try:
+            key = clean(label.inner_text()).rstrip(':')
+            if norm(key) not in known_norm:
+                continue
+            value = ''
+            for selector in ['xpath=following-sibling::*[1]', 'xpath=following::*[1]']:
+                try:
+                    candidate = clean(label.locator(selector).inner_text(timeout=500))
+                    if candidate and norm(candidate.rstrip(':')) not in known_norm:
+                        value = candidate
+                        break
+                except Exception:
+                    pass
+            add(key, value)
+        except Exception:
+            continue
     return pairs
 
-def first_match(mapping, *terms):
-    for k,v in mapping.items():
-        if any(t in norm(k) for t in terms) and clean(v): return clean(v)
-    return ''
 
+def first_match(mapping, *terms):
+    """Match normalized labels exactly, not by unsafe substring matching."""
+    wanted = {norm(t) for t in terms}
+    for key, value in mapping.items():
+        if norm(key) in wanted and clean(value):
+            return clean(value)
+    return ''
 def extract_event_id(url, mapping, text):
     query = parse_qs(urlparse(url).query)
     # eSourceNumber is the official stable event identifier; never use generic table text.
@@ -217,10 +246,10 @@ def extract_event_id(url, mapping, text):
     for key, value in mapping.items():
         if norm(key) in {'eventid', 'eventnumber', 'esourcenumber'}:
             candidate = clean(value)
-            match = re.search(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\\b', candidate, re.I)
+            match = re.search(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\b', candidate, re.I)
             if match:
                 return match.group(0)
-    match = re.search(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\\b', text, re.I)
+    match = re.search(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\b', text, re.I)
     return match.group(0) if match else ''
 
 def scrape_search_keyword(page, keyword):
@@ -377,9 +406,11 @@ def scrape_details(page, url, keywords):
         try:
             candidates=page.locator(sel).all_inner_texts()
             for candidate in candidates:
-                candidate=clean(candidate)
-                if re.match(r'^(RFP|RFQ|RFI|ITB|IFB|RFx)\s*[-#:]?\s*\w+', candidate, re.I):
-                    title=candidate
+                candidate = clean(candidate)
+                if (len(candidate) >= 8
+                        and not re.fullmatch(r'(event details|documents|event information|procurement|home|search results?)', candidate, re.I)
+                        and not re.search(r'^(event status|purchase type|category type|government type|fiscal year)\b', candidate, re.I)):
+                    title = candidate
                     break
             if title: break
         except Exception: pass
@@ -409,9 +440,6 @@ def scrape_details(page, url, keywords):
     government_type=metadata.get('Government Type','') or first_match(mapping,'governmenttype')
     fiscal_year=metadata.get('Fiscal Year','') or first_match(mapping,'fiscalyear')
     event_type=metadata.get('Event Type','') or first_match(mapping,'eventtype')
-    if not status:
-        m=re.search(r'Event Status\s+([A-Za-z ]+?)(?:\s+Purchase Type|\s+Category Type)',text,re.I)
-        if m: status=clean(m.group(1))
     start=first_match(mapping,'startdate','eventstart')
     end=first_match(mapping,'enddate','closingdate','duedate','deadline')
     start_match=re.search(r'Start Date:\s*(.*?)(?:\s+End Date:|$)',text,re.I)
@@ -419,7 +447,7 @@ def scrape_details(page, url, keywords):
     if start_match: start=clean(start_match.group(1))
     if end_match: end=clean(end_match.group(1))
     if not end:
-        m=re.search(r'(?:End Date|Closing Date|Deadline Date)[: ]+([^\\n]{5,100})', text, re.I)
+        m=re.search(r'(?:End Date|Closing Date|Deadline Date)[: ]+([^\n]{5,100})', text, re.I)
         if m: end=clean(m.group(1))
     contact_name=first_match(mapping,'buyercontact','contactname','buyername')
     if not contact_name:
@@ -441,6 +469,8 @@ def scrape_details(page, url, keywords):
     category=category_type or first_match(mapping,'category','purchasetype','eventtype')
     event_type=event_type or first_match(mapping,'type of response','response type')
     address=first_match(mapping,'address','buyeraddress','contactaddress')
+    ref_match = re.search(r'\b(?:RFP|RFQ|RFI|ITB|IFB|RFx)\s*[-#]?\s*[A-Z0-9][A-Z0-9-]*', title, re.I)
+    solicitation_ref = clean(ref_match.group(0)) if ref_match else ''
     # Prefer event-specific external links; do not store a generic opportunities index.
     agency_site_url = ''
     try:
@@ -488,8 +518,6 @@ def scrape_details(page, url, keywords):
     event_id=event_id or ''
     # The solicitation/reference number is commonly embedded in the title (e.g. RFP828),
     # while Event ID is the longer eSourceNumber. Keep these as separate fields.
-    ref_match = re.search(r'\b(?:RFP|RFQ|RFI|ITB|IFB|RFx)\s*[-#]?\s*[A-Z0-9][A-Z0-9-]*', title, re.I)
-    solicitation_ref = clean(ref_match.group(0)) if ref_match else ''
     # Prefer a real end-date time if available; do not duplicate the whole date into the time column.
     deadline_time = ''
     tm = re.search(r'\b(\d{1,2}:\d{2}\s*(?:AM|PM)?\s*(?:ET|EST|EDT|CT|CST|CDT|MT|MST|MDT|PT|PST|PDT|UTC)?)\b', end, re.I)
@@ -508,7 +536,7 @@ def scrape_details(page, url, keywords):
       'Risks / Gaps':'Confirm healthcare/IT relevance, requirements, deadline and eligibility in the official event documents.',
       'Next Action':'Open official event; review documents and complete scoring.','Last Verified Date':datetime.now().strftime('%Y-%m-%d'),
       'Owner':'','Review Status':'Needs Review','Reviewer Notes':'','Search Keywords Matched':'; '.join(sorted(set(keywords))),
-      'First Seen Date':'','Last Seen Date':'','Event Status':status,'Event Start Date/Time':start,'Buyer Contact Name':contact_name,
+      'First Seen Date':'','Last Seen Date':'','Event Start Date/Time':start,'Buyer Contact Name':contact_name,
       'Buyer Contact Phone':phone,'Buyer Contact Email':email,'Buyer Contact Address':address,
       'Contact Extraction Status':'Contact found' if (contact_name or phone or email) else 'Not found on page',
       'Last Updated At':datetime.now().isoformat(timespec='seconds'),'Record Hash':''}
