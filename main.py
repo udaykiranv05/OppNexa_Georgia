@@ -185,13 +185,19 @@ def first_match(mapping, *terms):
     return ''
 
 def extract_event_id(url, mapping, text):
-    for k,v in mapping.items():
-        if 'eventid' in norm(k) or 'eventnumber' in norm(k):
-            if v: return clean(v)
-    m=re.search(r'Event ID\s+([A-Z0-9][A-Z0-9-]{4,})', text, re.I)
-    if m:return m.group(1)
-    q=parse_qs(urlparse(url).query)
-    return clean((q.get('eSourceNumber') or q.get('eventId') or [''])[0])
+    query = parse_qs(urlparse(url).query)
+    # eSourceNumber is the official stable event identifier; never use generic table text.
+    source_id = clean((query.get('eSourceNumber') or query.get('eventId') or [''])[0])
+    if source_id:
+        return source_id
+    for key, value in mapping.items():
+        if norm(key) in {'eventid', 'eventnumber', 'esourcenumber'}:
+            candidate = clean(value)
+            match = re.search(r'\\b[A-Z]{2}-[A-Z0-9-]{8,}\\b', candidate, re.I)
+            if match:
+                return match.group(0)
+    match = re.search(r'\\b[A-Z]{2}-[A-Z0-9-]{8,}\\b', text, re.I)
+    return match.group(0) if match else ''
 
 def scrape_search_keyword(page, keyword):
     # Use the public registry landing page, not the old /index route.
@@ -247,12 +253,60 @@ def scrape_search_keyword(page, keyword):
         except Exception: break
     return found
 
+def text_label_value(text, label, stop_labels):
+    """Extract a single value from flattened visible page text using neighboring labels."""
+    stops = "|".join(re.escape(x) for x in stop_labels)
+    pattern = rf"(?:^|\\s){re.escape(label)}\\s*:?\\s*(.*?)(?=\\s+(?:{stops})\\s*:?\\s*|$)"
+    match = re.search(pattern, text, re.I)
+    return clean(match.group(1)) if match else ''
+
+def extract_event_metadata(text, url, mapping):
+    # These labels appear together in the registry's event-detail table; table row
+    # aggregation can mistakenly pair one label with the next label, so parse text too.
+    labels = [
+        'Event Type', 'Event Status', 'Purchase Type', 'Category Type',
+        'Government Type', 'Fiscal Year', 'Start Date', 'End Date',
+        'Buyer Contact', 'Description', 'Agency', 'Entity'
+    ]
+    result = {}
+    for label in labels:
+        stops = [x for x in labels if x != label]
+        result[label] = text_label_value(text, label, stops)
+
+    # Event status is usually a single word like Open / Closed / Awarded.
+    status_match = re.search(r'\\bEvent Status\\s*:?[ \\t]*(Open|Closed|Cancelled|Canceled|Awarded|Evaluated|Pending|Draft)\\b', text, re.I)
+    if status_match:
+        result['Event Status'] = status_match.group(1).title()
+
+    # Event ID comes from the URL query, never a generic "Event" table value.
+    result['Event ID'] = extract_event_id(url, mapping, text)
+
+    # Event title is commonly shown before the Start Date.
+    title_match = re.search(
+        r'((?:RFP|RFQ|RFI|ITB|IFB|RFx)\\s*[-#]?\\s*[A-Z0-9][A-Z0-9-]*\\s*[-:–—]\\s*.+?)(?=\\s+Start Date\\s*:|\\s+End Date\\s*:|\\s+Event Details\\b)',
+        text, re.I)
+    if title_match:
+        result['Opportunity Title'] = clean(title_match.group(1))
+
+    # The agency name is visible around the Event ID / Buyer Contact section.
+    agency_match = re.search(
+        r'\\b' + re.escape(result['Event ID']) + r'\\s+(.+?)(?=\\s+Buyer Contact\\s*:|\\s+Description\\s*:|\\s+Event Type\\s*:)',
+        text, re.I) if result['Event ID'] else None
+    if agency_match:
+        candidate = clean(agency_match.group(1))
+        # Remove labels accidentally included by flattened layout.
+        candidate = re.split(r'\\s+(?:Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year)\\b', candidate, flags=re.I)[0]
+        if candidate and len(candidate) < 180:
+            result['Agency'] = candidate
+    return result
+
 def scrape_details(page, url, keywords):
     page.goto(url, wait_until='domcontentloaded', timeout=60000)
     page.wait_for_timeout(500)
     text=clean(page.locator('body').inner_text(timeout=15000))
     mapping=label_value_map(page)
-    event_id=extract_event_id(url,mapping,text)
+    metadata=extract_event_metadata(text, url, mapping)
+    event_id=metadata.get('Event ID') or extract_event_id(url,mapping,text)
     # The visible page heading is the authoritative opportunity title (e.g. RFP828 - ...).
     title=''
     for sel in ['h1','h2','h3','.page-title','.event-title']:
@@ -270,18 +324,20 @@ def scrape_details(page, url, keywords):
         m=re.search(r'((?:RFP|RFQ|RFI|ITB|IFB)\s*\d+\s*[-:–—]\s*[^\n]{4,220}?)(?=\s+Start Date:|\s+End Date:|\s+Event Details)', text, re.I)
         if m: title=clean(m.group(1))
     if not title:
+        title=metadata.get('Opportunity Title','')
+    if not title:
         title=first_match(mapping,'eventtitle','opportunitytitle','solicitationtitle','title')
     # Always initialize agency independently of title extraction.
-    agency=first_match(mapping,'agency','governmententity','entityname','agencyname')
+    agency=metadata.get('Agency','') or first_match(mapping,'agency','governmententity','entityname','agencyname')
     if not agency:
         m=re.search(r'\b\d{5}\s+([A-Z][A-Z0-9 ,&().\-/]+?)(?:\s+Buyer Contact:|\s+Description)',text)
         if m: agency=clean(m.group(1))
-    status=first_match(mapping,'eventstatus','status')
-    purchase_type=first_match(mapping,'purchasetype')
-    category_type=first_match(mapping,'categorytype')
-    government_type=first_match(mapping,'governmenttype')
-    fiscal_year=first_match(mapping,'fiscalyear')
-    event_type=first_match(mapping,'eventtype')
+    status=metadata.get('Event Status','') or first_match(mapping,'eventstatus','status')
+    purchase_type=metadata.get('Purchase Type','') or first_match(mapping,'purchasetype')
+    category_type=metadata.get('Category Type','') or first_match(mapping,'categorytype')
+    government_type=metadata.get('Government Type','') or first_match(mapping,'governmenttype')
+    fiscal_year=metadata.get('Fiscal Year','') or first_match(mapping,'fiscalyear')
+    event_type=metadata.get('Event Type','') or first_match(mapping,'eventtype')
     if not status:
         m=re.search(r'Event Status\s+([A-Za-z ]+?)(?:\s+Purchase Type|\s+Category Type)',text,re.I)
         if m: status=clean(m.group(1))
@@ -327,7 +383,16 @@ def scrape_details(page, url, keywords):
     # Explicitly extract the visible countdown shown beside the end date.
     days_until=''
     dm=re.search(r'Ends In:\s*(\d+)\s*days?', text, re.I)
-    if dm: days_until=dm.group(1)
+    if dm:
+        days_until=dm.group(1)
+    if not days_until and end:
+        date_match = re.search(r'(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2},?\\s+20\\d{2}', end, re.I)
+        if date_match:
+            try:
+                deadline_dt = datetime.strptime(date_match.group(0).replace(',', ''), '%b %d %Y')
+                days_until = str((deadline_dt.date() - datetime.now().date()).days)
+            except ValueError:
+                pass
     event_id=event_id or ''
     # The solicitation/reference number is commonly embedded in the title (e.g. RFP828),
     # while Event ID is the longer eSourceNumber. Keep these as separate fields.
@@ -378,10 +443,12 @@ def is_complete_record(row):
     has_deadline = bool(deadline and re.search(
         r'20\d{2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec', deadline, re.I))
     has_scope = bool(scope and len(re.sub(r'https?://\S+', '', scope).strip()) >= 30)
-    has_status = bool(status and status.lower() not in {'unknown', 'n/a', 'none'})
-    valid_url = 'eventdetails' in url.lower() and ('esourcenumber=' in url.lower() or has_event_id)
+    has_status = status.lower() in {'open', 'closed', 'cancelled', 'canceled', 'awarded', 'evaluated', 'pending', 'draft'}
+    valid_url = 'eventdetails' in url.lower() and 'esourcenumber=' in url.lower()
+    # An Event ID like the word "Event" is invalid even if the title/deadline look good.
+    valid_event_id = bool(re.fullmatch(r'[A-Z]{2}-[A-Z0-9-]{8,}', event_id, re.I))
 
-    return all([not invalid_title, not invalid_agency, has_event_id,
+    return all([not invalid_title, not invalid_agency, valid_event_id,
                 has_deadline, has_scope, has_status, valid_url])
 
 def export_data(records, review_records, diagnostics):
