@@ -374,29 +374,64 @@ LABELS = {norm(x) for x in [
 
 
 def label_value_map(page):
+    """Extract label/value pairs without pairing one label with the next label."""
     pairs = {}
 
     def add(k, v):
         k, v = clean(k).rstrip(':').strip(), clean(v)
-        if not k or not v or norm(k) not in LABELS or norm(v) in LABELS: return
+        if not k or not v or norm(k) not in LABELS or norm(v) in LABELS:
+            return
+        # Reject values that are actually a run of several field labels.
+        if re.fullmatch(r'(?:(?:Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year|Agency Site|Link)\s*)+', v, re.I):
+            return
         pairs.setdefault(k, v)
 
+    # Standard label/value table rows.
     for tr in page.locator('tr').all():
         try:
             cells = [clean(x).rstrip(':') for x in tr.locator('th,td').all_inner_texts()]
-            i = 0
-            while i + 1 < len(cells):
-                if norm(cells[i]) in LABELS: add(cells[i], cells[i + 1]); i += 2
-                else: i += 1
-        except Exception: pass
+            for i, cell in enumerate(cells[:-1]):
+                if norm(cell) in LABELS:
+                    # Find the next non-label cell, but never step across a new label.
+                    candidate = cells[i + 1]
+                    if norm(candidate) not in LABELS:
+                        add(cell, candidate)
+        except Exception:
+            pass
+
+    # Definition lists and common label/value layouts.
     for dt in page.locator('dt').all():
-        try: add(dt.inner_text(), dt.locator('xpath=following-sibling::*[1]').inner_text())
-        except Exception: pass
+        try:
+            add(dt.inner_text(), dt.locator('xpath=following-sibling::*[1]').inner_text())
+        except Exception:
+            pass
+
     for lab in page.locator('label').all():
         try:
             target = lab.get_attribute('for')
-            add(lab.inner_text(), page.locator('#' + target).input_value() if target else '')
-        except Exception: pass
+            if target:
+                add(lab.inner_text(), page.locator('#' + target).input_value())
+        except Exception:
+            pass
+
+    # For key/value cards where a label and value share a parent but aren't in a table.
+    # Keep this intentionally narrow: only accept a value from a sibling/child node,
+    # never the whole parent text (which often contains several unrelated labels).
+    for label in LABELS:
+        try:
+            loc = page.get_by_text(re.compile(r'^\s*' + re.escape(label) + r'\s*:?\s*$', re.I)).all()
+            for node in loc[:8]:
+                try:
+                    value = node.locator('xpath=following-sibling::*[1]').inner_text(timeout=500)
+                    add(label, value)
+                except Exception:
+                    try:
+                        value = node.locator('xpath=..').locator(':scope > *').nth(1).inner_text(timeout=500)
+                        add(label, value)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     return pairs
 
 
@@ -404,6 +439,61 @@ def first_match(mapping, *terms):
     wanted = {norm(t) for t in terms if norm(t)}
     for k, v in mapping.items():
         if norm(k) in wanted and clean(v): return clean(v)
+    return ''
+
+
+def metadata_value(label, text, mapping, *aliases):
+    """Use exact label/value extraction first; use narrow known-value fallbacks second."""
+    def usable(candidate):
+        candidate = clean(candidate)
+        if not candidate or len(candidate) > 180 or norm(candidate) in LABELS:
+            return False
+        if re.search(r'\b(?:Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year|Agency Site)\b', candidate, re.I):
+            return False
+        if re.search(r'https?://|\b[A-Z]{2}-[A-Z0-9-]{8,}\b', candidate, re.I):
+            return False
+        field_name = norm(label)
+        if field_name == norm('Event Status'):
+            return candidate.lower() in VALID_STATUSES
+        if field_name in {norm('Event Type'), norm('Purchase Type')}:
+            return bool(re.search(r'\b(?:Non-State Agency|State Agency)\b', candidate, re.I))
+        if field_name == norm('Fiscal Year'):
+            return bool(re.fullmatch(r'20\d{2}', candidate))
+        if field_name == norm('Government Type') and candidate.lower() in {'other', 'state', 'local', 'federal', 'county', 'city', 'municipal'}:
+            return True
+        return True
+
+    value = first_match(mapping, label, *aliases)
+    if usable(value):
+        return clean(value)
+
+    # Most pages place a value directly after its label in the rendered text.
+    value = section(text, label)
+    if usable(value):
+        return clean(value)
+
+    # Some GPR pages render all metadata labels first and all values in a separate
+    # block. These constrained patterns recover common field values without shifting
+    # neighbouring fields into one another.
+    if norm(label) == norm('Event Status'):
+        m = re.search(r'\b(Open|Closed|Cancelled|Canceled|Awarded|Evaluated|Pending|Draft)\b', text, re.I)
+        return m.group(1).title() if m else ''
+    if norm(label) in {norm('Event Type'), norm('Purchase Type')}:
+        m = re.search(r'\b(Non-State Agency|State Agency)\b', text, re.I)
+        return m.group(1) if m else ''
+    if norm(label) == norm('Category Type'):
+        m = re.search(r'\b(Services\s*/\s*Special Projects|Goods|Services|Construction|IT Services)\b', text, re.I)
+        return clean(m.group(1)) if m else ''
+    if norm(label) == norm('Government Type'):
+        m = re.search(r'\b(other|state|local|federal|county|city|municipal)\b', text, re.I)
+        return m.group(1).lower() if m else ''
+    if norm(label) == norm('Fiscal Year'):
+        # Prefer a year in the event ID (e.g. ...-2027-...) over an unrelated date.
+        m = re.search(r'\b[A-Z]{2}-[A-Z0-9]+-[A-Z]+-(20\d{2})-', text, re.I)
+        if m:
+            return m.group(1)
+        m = re.search(r'\bFiscal Year\s*:?[ \t]*(20\d{2})\b', text, re.I)
+        return m.group(1) if m else ''
     return ''
 
 
@@ -453,7 +543,11 @@ def parse_contact(page, text, mapping):
         name = clean(m.group(1)).strip(' ,')
         address = clean(rest[m.end():]).strip(' |,')
     address = first_match(mapping, 'address', 'buyeraddress', 'contactaddress') or address
-    if len(address) > 250 or re.search(r'\b(Event Type|Event Status|Purchase Type)\b', address): address = ''
+    # Never put an email/phone or another metadata label into the address column.
+    if EMAIL_RE.search(address) or PHONE_RE.search(address):
+        address = ''
+    if len(address) > 250 or re.search(r'\b(Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year)\b', address):
+        address = ''
     if name and EMAIL_RE.search(name): name = ''
     return {'name': name, 'phone': phone, 'email': email, 'address': address}
 
@@ -506,19 +600,27 @@ def extract_agency_site_url(page, title, ref):
             absolute = urljoin(page.url, href)
             pu = urlparse(absolute)
             if pu.scheme not in {'http', 'https'}: continue
-            if pu.netloc.endswith(('doas.state.ga.us', 'doas.ga.gov')) and 'download' not in absolute.lower(): continue
+            # Do not misclassify government-system attachments, PDFs, or generic portals
+            # as the buyer's own opportunity page.
+            low_url = absolute.lower()
+            if pu.netloc.endswith(('doas.state.ga.us', 'doas.ga.gov')):
+                continue
+            if any(x in low_url for x in ('downloadattachment', 'attachmentid=', '.pdf', '/documents/', '/uploads/')):
+                continue
             if pu.path.rstrip('/').lower() in {'', '/', '/opportunities', '/procurement/opportunities', '/gpr'}: continue
             try: label = clean(a.inner_text(timeout=500))
             except Exception: label = ''
             hay = (label + ' ' + href).lower()
-            score = 3 + (10 if ref_slug and ref_slug in re.sub(r'[^a-z0-9]+', '-', hay) else 0) + sum(2 for w in words if w in hay)
-            if score > best_score: best, best_score = absolute, score
+            # Require a real relevance signal; do not pick the first arbitrary link.
+            score = (20 if ref_slug and ref_slug in re.sub(r'[^a-z0-9]+', '-', hay) else 0) + sum(2 for w in words if w in hay)
+            if score >= 4 and score > best_score:
+                best, best_score = absolute, score
     except Exception:
         logging.exception('agency-site URL extraction failed')
     return best
 
 
-def scrape_details(page, url, keywords):
+def scrape_details(page, url, keywords, assume_open=False):
     with_retries(lambda: page.goto(url, wait_until='domcontentloaded', timeout=60000), f'detail {url}')
     try: page.wait_for_load_state('networkidle', timeout=15000)
     except Exception: page.wait_for_timeout(1200)
@@ -529,14 +631,16 @@ def scrape_details(page, url, keywords):
     title = extract_title(page, text, mapping)
     agency = extract_agency(text, mapping)
 
-    st = re.search(r'\bEvent Status\s*:?\s*(Open|Closed|Cancelled|Canceled|Awarded|Evaluated|Pending|Draft)\b', text, re.I)
-    status = st.group(1).title() if st else first_match(mapping, 'eventstatus').title()
-    if status.lower() not in VALID_STATUSES: status = ''
+    status = metadata_value('Event Status', text, mapping, 'eventstatus')
+    if status.lower() not in VALID_STATUSES:
+        status = ''
+    # Search results were explicitly filtered to OPEN. Only use this fallback for
+    # events discovered in that filtered result set, not arbitrary refreshed records.
+    if not status and assume_open:
+        status = 'Open'
 
     def field(label, *aliases):
-        v = section(text, label)
-        if norm(v) in LABELS or len(v) > 150: v = ''
-        return v or first_match(mapping, *aliases)
+        return metadata_value(label, text, mapping, *aliases)
 
     event_type = field('Event Type', 'eventtype')
     purchase_type = field('Purchase Type', 'purchasetype')
@@ -568,7 +672,7 @@ def scrape_details(page, url, keywords):
 
     links = f'Event details: {url}#pane-eventDetails\nDocuments: {url}#pane-documents'
     scope = (desc[:3500] + '\n' + links) if desc else links
-    found_contact = any(contact.values())
+    found_contact = bool(contact['name'] or contact['phone'] or contact['email'] or contact['address'])
 
     return {
         'Opportunity ID': event_id or hashlib.sha1(url.encode()).hexdigest()[:12].upper(), 'State': 'Georgia',
@@ -614,8 +718,8 @@ def validate_record(row):
         reasons.append('Deadline Date missing/unparseable')
     if len(re.sub(r'(Event details|Documents):\s*https?://\S+', '', clean(row.get('Scope Summary'))).strip()) < 30:
         reasons.append('Scope/Description missing or too short')
-    if clean(row.get('Event Status')).lower() not in VALID_STATUSES:
-        reasons.append('Event Status missing/unrecognised')
+    # Event status and contact/published metadata are useful but not identity blockers.
+    # Missing core identity/title/source/agency/deadline/scope still routes to review.
     for col, label in [('Buyer Contact Name', 'Buyer name'), ('Buyer Contact Phone', 'Buyer phone'),
                        ('Buyer Contact Email', 'Buyer email'), ('Buyer Contact Address', 'Buyer address'),
                        ('Agency Site URL', 'Agency site URL'), ('Published Date', 'Published date'),
@@ -636,10 +740,28 @@ def detect_changes(prior, new):
 def merge_with_prior(row, prior, seen_today):
     """Apply human-entered values, keep good old data if extraction came back blank, and track website changes."""
     # keep previously good scraped values when this run could not extract them (never wipe on a flaky page)
+    metadata_cols = {'Event Type', 'Purchase Type', 'Category Type', 'Government Type', 'Fiscal Year', 'Event Status'}
     for col in CHANGE_FIELDS + ['Solicitation / Reference No.', 'Event Type', 'Purchase Type', 'Category Type',
                                  'Government Type', 'Fiscal Year', 'Days Until Deadline']:
-        if not clean(row.get(col, '')) and clean(prior.get(col, '')) and col != 'Days Until Deadline':
-            row[col] = prior[col]
+        old_value = clean(prior.get(col, ''))
+        # Do not carry forward values known to be shifted into the wrong column by
+        # the previous parser. Re-scraping should repair these, not preserve them.
+        old_is_corrupt = False
+        if col == 'Opportunity Title' and old_value.lower() in {'event', 'announcement', 'announcements', 'untitled'}:
+            old_is_corrupt = True
+        if col in metadata_cols and old_value:
+            if re.search(r'\b(?:Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year|Agency Site)\b', old_value, re.I):
+                old_is_corrupt = True
+            if col == 'Fiscal Year' and not re.fullmatch(r'20\d{2}', old_value):
+                old_is_corrupt = True
+            if col == 'Event Status' and old_value.lower() not in VALID_STATUSES:
+                old_is_corrupt = True
+        if col == 'Agency Site URL' and old_value:
+            low = old_value.lower()
+            if 'downloadattachment' in low or 'attachmentid=' in low or 'ssl.doas.state.ga.us' in low or 'doas.ga.gov' in low:
+                old_is_corrupt = True
+        if not clean(row.get(col, '')) and old_value and col != 'Days Until Deadline' and not old_is_corrupt:
+            row[col] = old_value
     for col in HUMAN_FIELDS:
         if clean(prior.get(col, '')): row[col] = prior[col]
     first = clean(prior.get('Date Found')) or clean(prior.get('Date Added to Review')) or today_str()
@@ -757,7 +879,7 @@ def main():
         # ---- 3. scrape each detail page
         for n, (key, url, kws, seen_today) in enumerate(items, 1):
             try:
-                row = scrape_details(page, url, kws)
+                row = scrape_details(page, url, kws, assume_open=seen_today)
                 prior = find_prior(row.get('Event ID'), url)
                 status = clean(row.get('Event Status')).lower()
                 if not prior and status in CLOSED_STATUSES:
