@@ -1,5 +1,5 @@
 {
-  "run_at": "2026-10-23T14:48:23.705446+00:00",
+  "run_at": "2026-10-23T15:08:14.898149+00:00",
   "status_filter": "OPEN",
   "keywords_total": 23,
   "keyword_stats": [
@@ -104,7 +104,7 @@
       "total_reported": 1,
       "links_found": 1,
       "pages": 1,
-      "new_events": 1,
+      "new_events": 0,
       "error": ""
     },
     {
@@ -192,8 +192,8 @@
   "unique_events_discovered": 1,
   "details_attempted": 1,
   "records_scraped": 1,
-  "tracker_records": 0,
-  "manual_review_records": 1,
+  "tracker_records": 1,
+  "manual_review_records": 0,
   "changed_records": 0,
   "skipped_new_non_open": 0,
   "moved_review_to_tracker": 0,
