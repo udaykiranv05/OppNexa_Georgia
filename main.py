@@ -1,729 +1,833 @@
 import os, re, json, time, hashlib, logging, csv
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from urllib.parse import urljoin, urlparse, parse_qs
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from zoneinfo import ZoneInfo
+
+from playwright.sync_api import sync_playwright
 import gspread
+from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
 
-# Current public GPR pages and event details are served on pur.doas.ga.gov.
+# ----------------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------------
 BASE_URL = 'https://ssl.doas.state.ga.us/gpr/'
 SEARCH_URL = BASE_URL + 'index?persisted=true'
-CANONICAL_BASE_URL = 'https://pur.doas.ga.gov/gpr/'
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID', '1T_cg_DBR5WG7vrQZuNqV4hP6BC_BY5sMpwx1v7j5IoU')
 TRACKER_GID = int(os.getenv('TRACKER_GID', '2125924989'))
 REVIEW_GID = int(os.getenv('REVIEW_GID', '1667806659'))
+KEYWORD_LOG_TITLE = os.getenv('KEYWORD_LOG_TITLE', 'Keyword Run Log')
 MAX_DETAILS = int(os.getenv('MAX_DETAILS_PER_RUN', '200'))
 MAX_PAGES_PER_KEYWORD = int(os.getenv('MAX_PAGES_PER_KEYWORD', '10'))
 DELAY = float(os.getenv('REQUEST_DELAY_SECONDS', '0.5'))
+RETRIES = int(os.getenv('PAGE_RETRIES', '3'))
+TZ = ZoneInfo('America/New_York')          # Georgia time, used for "days until deadline"
+DEBUG_DIR = 'data/debug'
 
 KEYWORDS = [
-'Electronic Health Record','Electronic Medical Record','Health Information Exchange','Health Information Technology',
-'Healthcare Information System','Clinical Information System','Hospital Information System','Electronic Visit Verification',
-'Medicaid Management Information System','Public Health Information System','Healthcare Analytics','Healthcare Interoperability',
-'Application Development','Application Modernization','Data Integration','API Integration','Cloud Migration',
-'Managed Security Services','Healthcare Cybersecurity','IT Staff Augmentation','Artificial Intelligence','Machine Learning',
-'Integrated Eligibility'
+    'Electronic Health Record', 'Electronic Medical Record', 'Health Information Exchange', 'Health Information Technology',
+    'Healthcare Information System', 'Clinical Information System', 'Hospital Information System', 'Electronic Visit Verification',
+    'Medicaid Management Information System', 'Public Health Information System', 'Healthcare Analytics', 'Healthcare Interoperability',
+    'Application Development', 'Application Modernization', 'Data Integration', 'API Integration', 'Cloud Migration',
+    'Managed Security Services', 'Healthcare Cybersecurity', 'IT Staff Augmentation', 'Artificial Intelligence', 'Machine Learning',
+    'Integrated Eligibility'
 ]
 
+# New columns (appended automatically to the sheets if they do not exist yet).
+EXTRA_COLUMNS = ['Failure Reason', 'Missing Fields', 'Last Changed Date', 'Change Summary']
+
 TRACKER_HEADERS = [
-'Opportunity ID','Date Found','State','Agency','Opportunity Title','Solicitation / Reference No.','Opportunity Type','Service Category',
-'Official Source URL','Agency Site URL','Event ID','Event Type','Purchase Type','Category Type','Government Type','Fiscal Year','Published Date','Deadline Date','Deadline Time / Time Zone','Days Until Deadline','Estimated Value (if published)','Scope Summary',
-'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)',
-'Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)','Customer / Contract Fit (0-15)','Delivery Capability (0-15)',
-'Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)','Information Completeness (0-5)','Total Score (0-100)',
-'Mandatory Gate (Pass / Fail / Unknown)','Recommendation (Go / Investigate / No-Go)','Fit Rationale','Risks / Gaps','Next Action',
-'Last Verified Date','Owner','Review Status','Reviewer Notes','Search Keywords Matched','First Seen Date','Last Seen Date',
-'Event Status','Event Start Date/Time','Buyer Contact Name','Buyer Contact Phone','Buyer Contact Email','Buyer Contact Address',
-'Contact Extraction Status','Last Updated At','Record Hash'
-]
+    'Opportunity ID', 'Date Found', 'State', 'Agency', 'Opportunity Title', 'Solicitation / Reference No.', 'Opportunity Type', 'Service Category',
+    'Official Source URL', 'Agency Site URL', 'Event ID', 'Event Type', 'Purchase Type', 'Category Type', 'Government Type', 'Fiscal Year',
+    'Published Date', 'Deadline Date', 'Deadline Time / Time Zone', 'Days Until Deadline', 'Estimated Value (if published)', 'Scope Summary',
+    'Eligibility / Mandatory Requirements', 'Required Certifications / Experience', 'Contract Duration / Options', 'Incumbent / Prior Award (verified only)',
+    'Healthcare IT Fit (0-25)', 'Eligibility & Compliance (0-20)', 'Customer / Contract Fit (0-15)', 'Delivery Capability (0-15)',
+    'Deadline Feasibility (0-10)', 'Commercial Attractiveness (0-10)', 'Information Completeness (0-5)', 'Total Score (0-100)',
+    'Mandatory Gate (Pass / Fail / Unknown)', 'Recommendation (Go / Investigate / No-Go)', 'Fit Rationale', 'Risks / Gaps', 'Next Action',
+    'Last Verified Date', 'Owner', 'Review Status', 'Reviewer Notes', 'Search Keywords Matched', 'First Seen Date', 'Last Seen Date',
+    'Event Status', 'Event Start Date/Time', 'Buyer Contact Name', 'Buyer Contact Phone', 'Buyer Contact Email', 'Buyer Contact Address',
+    'Contact Extraction Status', 'Last Updated At', 'Record Hash'
+] + EXTRA_COLUMNS
+
 REVIEW_HEADERS = [
-    'Opportunity ID','Date Added to Review','State','Agency','Opportunity Title','Solicitation / Reference No.',
-    'Opportunity Type','Service Category','Official Source URL','Agency Site URL','Event ID','Event Type','Event Status',
-    'Purchase Type','Category Type','Government Type','Fiscal Year','Published Date','Deadline Date','Deadline Time / Time Zone',
-    'Days Until Deadline','Estimated Value (if published)','Scope Summary','Eligibility / Mandatory Requirements',
-    'Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)',
-    'Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)','Customer / Contract Fit (0-15)','Delivery Capability (0-15)',
-    'Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)','Information Completeness (0-5)','Total Score (0-100)',
-    'Mandatory Gate (Pass / Fail / Unknown)','Recommendation (Go / Investigate / No-Go)','Fit Rationale','Risks / Gaps',
-    'Next Action','Last Verified Date','Owner','Review Status','Reviewer Notes','Search Keywords Matched','First Seen Date',
-    'Last Seen Date','Event Start Date/Time','Buyer Contact Name','Buyer Contact Phone','Buyer Contact Email',
-    'Buyer Contact Address','Contact Extraction Status','Last Updated At','Record Hash'
+    'Opportunity ID', 'Date Added to Review', 'State', 'Agency', 'Opportunity Title', 'Solicitation / Reference No.',
+    'Opportunity Type', 'Service Category', 'Official Source URL', 'Agency Site URL', 'Event ID', 'Event Type', 'Event Status',
+    'Purchase Type', 'Category Type', 'Government Type', 'Fiscal Year', 'Published Date', 'Deadline Date', 'Deadline Time / Time Zone',
+    'Days Until Deadline', 'Estimated Value (if published)', 'Scope Summary', 'Eligibility / Mandatory Requirements',
+    'Required Certifications / Experience', 'Contract Duration / Options', 'Incumbent / Prior Award (verified only)',
+    'Healthcare IT Fit (0-25)', 'Eligibility & Compliance (0-20)', 'Customer / Contract Fit (0-15)', 'Delivery Capability (0-15)',
+    'Deadline Feasibility (0-10)', 'Commercial Attractiveness (0-10)', 'Information Completeness (0-5)', 'Total Score (0-100)',
+    'Mandatory Gate (Pass / Fail / Unknown)', 'Recommendation (Go / Investigate / No-Go)', 'Fit Rationale', 'Risks / Gaps',
+    'Next Action', 'Last Verified Date', 'Owner', 'Review Status', 'Reviewer Notes', 'Search Keywords Matched', 'First Seen Date',
+    'Last Seen Date', 'Event Start Date/Time', 'Buyer Contact Name', 'Buyer Contact Phone', 'Buyer Contact Email',
+    'Buyer Contact Address', 'Contact Extraction Status', 'Last Updated At', 'Record Hash'
+] + EXTRA_COLUMNS
+
+KEYWORD_LOG_HEADERS = ['Run Date', 'Run Time (UTC)', 'Keyword', 'Status Filter', 'Total Reported By Site',
+                       'Result Links Found', 'New Events (not stored before)', 'Pages Scraped', 'Error']
+
+# Fields filled by humans in the sheet: a non-empty sheet value always wins over the scraper.
+HUMAN_FIELDS = [
+    'Healthcare IT Fit (0-25)', 'Eligibility & Compliance (0-20)', 'Customer / Contract Fit (0-15)', 'Delivery Capability (0-15)',
+    'Deadline Feasibility (0-10)', 'Commercial Attractiveness (0-10)', 'Information Completeness (0-5)', 'Total Score (0-100)',
+    'Mandatory Gate (Pass / Fail / Unknown)', 'Recommendation (Go / Investigate / No-Go)', 'Fit Rationale', 'Risks / Gaps',
+    'Next Action', 'Owner', 'Review Status', 'Reviewer Notes', 'Eligibility / Mandatory Requirements',
+    'Required Certifications / Experience', 'Contract Duration / Options', 'Incumbent / Prior Award (verified only)'
 ]
+# Fields compared run-to-run so a buyer/owner edit on the website is detected and written to the sheet.
+CHANGE_FIELDS = [
+    'Opportunity Title', 'Agency', 'Event Status', 'Published Date', 'Deadline Date', 'Deadline Time / Time Zone',
+    'Event Start Date/Time', 'Estimated Value (if published)', 'Scope Summary', 'Agency Site URL',
+    'Buyer Contact Name', 'Buyer Contact Phone', 'Buyer Contact Email', 'Buyer Contact Address'
+]
+CLOSED_STATUSES = {'closed', 'cancelled', 'canceled', 'awarded'}
+VALID_STATUSES = {'open', 'closed', 'cancelled', 'canceled', 'awarded', 'evaluated', 'pending', 'draft'}
+LABEL_STOPS = ['Event Type', 'Event Status', 'Purchase Type', 'Category Type', 'Government Type', 'Fiscal Year',
+               'Start Date', 'End Date', 'Ends In', 'Buyer Contact', 'Description', 'Event Details', 'Documents',
+               'NIGP Codes', 'Procurement Help Desk', 'Link']
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
+
+# ----------------------------------------------------------------------------
+# SMALL HELPERS
+# ----------------------------------------------------------------------------
 def clean(s):
-    return re.sub(r'\s+', ' ', (s or '')).strip()
+    return re.sub(r'\s+', ' ', str(s if s is not None else '')).strip()
+
 
 def norm(s):
     return re.sub(r'[^a-z0-9]+', '', (s or '').lower())
 
-def hash_record(row):
-    fields = ['Opportunity Title','Agency','Event Status','Published Date','Deadline Date','Deadline Time / Time Zone','Scope Summary','Official Source URL','Buyer Contact Name','Buyer Contact Phone','Buyer Contact Email']
-    return hashlib.sha256('|'.join(clean(row.get(k,'')) for k in fields).encode()).hexdigest()[:20]
 
+def today_str():
+    return datetime.now(TZ).strftime('%Y-%m-%d')
+
+
+def now_iso():
+    return datetime.now(TZ).isoformat(timespec='seconds')
+
+
+def url_key(u):
+    return clean(u).split('#')[0]
+
+
+def hash_record(row):
+    return hashlib.sha256('|'.join(clean(row.get(k, '')) for k in CHANGE_FIELDS).encode()).hexdigest()[:20]
+
+
+MONTHS = {m: i for i, m in enumerate(['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'], 1)}
+
+
+def parse_date_time(s):
+    """Return (date|None, 'h:mm AM' string, tz string) from text like 'Nov 5, 2026 2:00 PM EST' or '11/05/2026 14:00'."""
+    s = clean(s)
+    d = None
+    m = re.search(r'\b(\d{1,2})/(\d{1,2})/(\d{4})\b', s)
+    if m:
+        try: d = date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+        except ValueError: pass
+    if not d:
+        m = re.search(r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b', s, re.I)
+        if m:
+            try: d = date(int(m.group(3)), MONTHS[m.group(1)[:3].lower()], int(m.group(2)))
+            except ValueError: pass
+    if not d:
+        m = re.search(r'\b(\d{4})-(\d{2})-(\d{2})\b', s)
+        if m:
+            try: d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except ValueError: pass
+    t = re.search(r'\b(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?\b', s, re.I)
+    time_s = clean(f"{t.group(1)}:{t.group(2)} {t.group(3) or ''}").upper() if t else ''
+    tz = re.search(r'\b(ET|EST|EDT|CT|CST|CDT|MT|MST|MDT|PT|PST|PDT|UTC)\b', s)
+    return d, time_s, (tz.group(1) if tz else '')
+
+
+def with_retries(fn, what, attempts=RETRIES):
+    last = None
+    for n in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:  # noqa
+            last = e
+            logging.warning('%s failed (attempt %s/%s): %s', what, n, attempts, str(e)[:200])
+            time.sleep(1.5 * n)
+    raise last
+
+
+# ----------------------------------------------------------------------------
+# GOOGLE SHEETS
+# ----------------------------------------------------------------------------
 def get_google_sheets():
     raw = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
     if not raw:
         raise RuntimeError('Missing GOOGLE_SERVICE_ACCOUNT_JSON GitHub secret')
-    info = json.loads(raw)
-    creds = Credentials.from_service_account_info(info, scopes=['https://www.googleapis.com/auth/spreadsheets','https://www.googleapis.com/auth/drive'])
-    client = gspread.authorize(creds)
-    book = client.open_by_key(SPREADSHEET_ID)
+    creds = Credentials.from_service_account_info(
+        json.loads(raw), scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive'])
+    book = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
     tracker = next((w for w in book.worksheets() if w.id == TRACKER_GID), None)
     review = next((w for w in book.worksheets() if w.id == REVIEW_GID), None)
     if tracker is None: raise RuntimeError(f'Tracker worksheet gid {TRACKER_GID} not found')
     if review is None: raise RuntimeError(f'Manual Review worksheet gid {REVIEW_GID} not found')
-    return tracker, review
+    try:
+        log_ws = book.worksheet(KEYWORD_LOG_TITLE)
+    except gspread.WorksheetNotFound:
+        log_ws = book.add_worksheet(title=KEYWORD_LOG_TITLE, rows=1000, cols=len(KEYWORD_LOG_HEADERS))
+    return tracker, review, log_ws
+
 
 def ensure_headers(ws, headers):
-    """Ensure required headers exist without deleting/reordering existing columns.
-
-    Automatically grows the Google worksheet grid before writing new headers.
-    Existing column names and data are left untouched; missing names are appended
-    to the next free columns. Safe to run on every scheduled execution.
-    """
-    from gspread.utils import rowcol_to_a1
-
+    """Append missing headers to the right; never reorder/delete existing columns."""
     existing = ws.row_values(1)
-    # Ignore only trailing blank header cells; preserve internal blank columns.
     while existing and not clean(existing[-1]):
         existing.pop()
-
     if not existing:
-        required_cols = len(headers)
-        if ws.col_count < required_cols:
-            ws.add_cols(required_cols - ws.col_count)
-        ws.update(range_name=f"A1:{rowcol_to_a1(1, required_cols)}",
-                  values=[headers], value_input_option="RAW")
+        if ws.col_count < len(headers): ws.add_cols(len(headers) - ws.col_count)
+        ws.update(range_name=f'A1:{rowcol_to_a1(1, len(headers))}', values=[headers], value_input_option='RAW')
         return list(headers)
-
-    # Treat existing names as authoritative and add only missing required names.
-    # Also avoid adding a duplicate if the same header appears twice in `headers`.
-    existing_names = {clean(h).casefold() for h in existing if clean(h)}
+    have = {clean(h).casefold() for h in existing if clean(h)}
     missing = []
-    for header in headers:
-        if clean(header).casefold() not in existing_names:
-            missing.append(header)
-            existing_names.add(clean(header).casefold())
-
+    for h in headers:
+        if clean(h).casefold() not in have:
+            missing.append(h); have.add(clean(h).casefold())
     if not missing:
         return existing
-
-    start_col = len(existing) + 1
-    end_col = start_col + len(missing) - 1
-    if ws.col_count < end_col:
-        # add_cols expands the grid without shrinking existing rows or columns.
-        ws.add_cols(end_col - ws.col_count)
-
-    start_cell = rowcol_to_a1(1, start_col)
-    end_cell = rowcol_to_a1(1, end_col)
-    ws.update(range_name=f"{start_cell}:{end_cell}", values=[missing], value_input_option="RAW")
-    logging.info("Expanded worksheet '%s' as needed; added %d missing headers (%d total columns)",
-                 ws.title, len(missing), end_col)
+    start, end = len(existing) + 1, len(existing) + len(missing)
+    if ws.col_count < end: ws.add_cols(end - ws.col_count)
+    ws.update(range_name=f'{rowcol_to_a1(1, start)}:{rowcol_to_a1(1, end)}', values=[missing], value_input_option='RAW')
+    logging.info("Worksheet '%s': added %d new header(s)", ws.title, len(missing))
     return existing + missing
+
 
 def rows_as_dicts(ws):
     vals = ws.get_all_values()
     if not vals: return [], []
     headers = vals[0]
-    out=[]
-    for r in vals[1:]:
+    out = []
+    for i, r in enumerate(vals[1:], start=2):
         if not any(clean(x) for x in r): continue
-        out.append({headers[i]: (r[i] if i < len(r) else '') for i in range(len(headers))})
+        d = {headers[c]: (r[c] if c < len(r) else '') for c in range(len(headers)) if clean(headers[c])}
+        d['_row'] = i
+        out.append(d)
     return headers, out
 
-def upsert_sheet(ws, headers, records, key='Opportunity ID'):
+
+def build_index(existing):
+    idx = {}
+    for old in existing:
+        for k in ('Opportunity ID', 'Event ID', 'Solicitation / Reference No.'):
+            v = clean(old.get(k, ''))
+            if v and v.lower() not in {'event', 'announcement', 'untitled'}:
+                idx.setdefault(v, old['_row'])
+        u = url_key(old.get('Official Source URL', ''))
+        if u: idx.setdefault('URL:' + u, old['_row'])
+    return idx
+
+
+def upsert_sheet(ws, headers, records):
+    """Batched upsert (few API calls instead of one per row)."""
     _, existing = rows_as_dicts(ws)
-    index = {}
-    for i, old in enumerate(existing):
-        rownum = i + 2
-        for candidate in (clean(old.get(key,'')), clean(old.get('Event ID','')), clean(old.get('Solicitation / Reference No.',''))):
-            if candidate and candidate.lower() not in {'event','announcement','untitled'}:
-                index.setdefault(candidate, rownum)
-        old_url = clean(old.get('Official Source URL','')).split('#')[0]
-        if old_url: index.setdefault('URL:' + old_url, rownum)
-    updated=0; appended=0
+    idx = build_index(existing)
+    updates, appends = [], []
     for rec in records:
-        k=clean(rec.get(key,''))
-        url_key='URL:' + clean(rec.get('Official Source URL','')).split('#')[0]
-        rownum = index.get(k) or index.get(clean(rec.get('Event ID',''))) or index.get(clean(rec.get('Solicitation / Reference No.',''))) or index.get(url_key)
-        values=[rec.get(h,'') for h in headers]
-        if rownum:
-            from gspread.utils import rowcol_to_a1
-            end_cell = rowcol_to_a1(rownum, len(headers))
-            ws.update(range_name=f'A{rownum}:{end_cell}', values=[values], value_input_option='USER_ENTERED')
-            updated += 1
+        row = (idx.get(clean(rec.get('Opportunity ID', ''))) or idx.get(clean(rec.get('Event ID', '')))
+               or idx.get('URL:' + url_key(rec.get('Official Source URL', ''))))
+        values = [clean(rec.get(h, '')) if not isinstance(rec.get(h, ''), (int, float)) else rec.get(h) for h in headers]
+        if row:
+            updates.append({'range': f'A{row}:{rowcol_to_a1(row, len(headers))}', 'values': [values]})
         else:
-            ws.append_row(values, value_input_option='USER_ENTERED')
-            appended += 1
-            rownum = len(existing) + 2 + appended - 1
-        for candidate in (k, clean(rec.get('Event ID','')), clean(rec.get('Solicitation / Reference No.',''))):
-            if candidate: index[candidate] = rownum
-        if url_key != 'URL:': index[url_key] = rownum
-    return appended, updated
+            appends.append(values)
+    for i in range(0, len(updates), 100):
+        with_retries(lambda c=updates[i:i + 100]: ws.batch_update(c, value_input_option='RAW'), 'batch_update')
+        time.sleep(1)
+    for i in range(0, len(appends), 200):
+        with_retries(lambda c=appends[i:i + 200]: ws.append_rows(c, value_input_option='RAW'), 'append_rows')
+        time.sleep(1)
+    return len(appends), len(updates)
+
+
+def remove_matching_rows(ws, moved_records):
+    """Delete rows (one batched request) that now belong to the other worksheet."""
+    if not moved_records: return 0
+    ids, urls = set(), set()
+    for r in moved_records:
+        for k in ('Event ID', 'Opportunity ID'):
+            if clean(r.get(k, '')): ids.add(clean(r[k]))
+        if url_key(r.get('Official Source URL', '')): urls.add(url_key(r['Official Source URL']))
+    _, rows = rows_as_dicts(ws)
+    targets = [x['_row'] for x in rows
+               if clean(x.get('Event ID', '')) in ids or clean(x.get('Opportunity ID', '')) in ids
+               or url_key(x.get('Official Source URL', '')) in urls]
+    targets = [t for t in set(targets)]
+    if targets:
+        reqs = [{'deleteDimension': {'range': {'sheetId': ws.id, 'dimension': 'ROWS', 'startIndex': r - 1, 'endIndex': r}}}
+                for r in sorted(targets, reverse=True)]
+        ws.spreadsheet.batch_update({'requests': reqs})
+    return len(targets)
+
+
+# ----------------------------------------------------------------------------
+# SEARCH PAGE
+# ----------------------------------------------------------------------------
+def parse_total_reported(text):
+    for pat in (r'of\s+([\d,]+)\s+(?:entries|results|records|events|opportunities)',
+                r'([\d,]+)\s+(?:entries|results|records|events|opportunities)\s+found',
+                r'(?:total|results?)\s*(?:records|events|found)?\s*:\s*([\d,]+)'):
+        m = re.search(pat, text, re.I)
+        if m: return int(m.group(1).replace(',', ''))
+    return ''
+
+
+def collect_links(page, keyword, found):
+    hrefs = page.eval_on_selector_all('a[href]', 'els => els.map(e => e.getAttribute("href"))')
+    n = 0
+    for href in hrefs:
+        low = (href or '').lower()
+        if 'esourcenumber=' not in low and 'eventdetails' not in low:
+            continue
+        url = urljoin(page.url, href)
+        url = re.sub(r'^https://pur\.doas\.ga\.gov/gpr/', BASE_URL, url)
+        key = parse_qs(urlparse(url).query).get('eSourceNumber', [url])[0]
+        found[key] = {'url': url, 'keyword': keyword}
+        n += 1
+    if n == 0:
+        # Fallback: results rendered without anchors -> build detail URL from visible event IDs.
+        try:
+            txt = clean(page.locator('body').inner_text(timeout=5000))
+            for eid in set(re.findall(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\b', txt)):
+                found.setdefault(eid, {'url': f'{BASE_URL}eventDetails?eSourceNumber={eid}', 'keyword': keyword})
+        except Exception:
+            pass
+    return n
+
+
+def scrape_search_keyword(page, keyword):
+    def load():
+        page.goto(SEARCH_URL, wait_until='domcontentloaded', timeout=60000)
+        page.wait_for_timeout(1500)
+    with_retries(load, f'search page for {keyword}')
+    body = ''
+    try: body = clean(page.locator('body').inner_text(timeout=5000))[:1200]
+    except Exception: pass
+    if '/unsupported' in page.url.lower() or 'unsupported browser' in body.lower():
+        raise RuntimeError(f'GPR returned unsupported-browser page at {page.url}: {body[:300]}')
+
+    field = page.get_by_placeholder(re.compile('Enter Event ID or Title', re.I)).first
+    if field.count() == 0: field = page.locator('input[type="text"]').first
+    field.fill(keyword)
+
+    # Status filter = OPEN; also raise page size to the largest option if a page-size dropdown exists.
+    for sel in page.locator('select').all():
+        try:
+            opts = [clean(x) for x in sel.locator('option').all_inner_texts()]
+            if any(x.upper() == 'OPEN' for x in opts):
+                sel.select_option(label=re.compile('^OPEN$', re.I))
+            elif opts and all(re.fullmatch(r'\d+', o) for o in opts):
+                sel.select_option(label=max(opts, key=int))
+        except Exception:
+            pass
+
+    btn = page.get_by_role('button', name=re.compile('^Search$', re.I)).first
+    if btn.count() == 0: btn = page.locator('input[type="submit"]').first
+    btn.click(timeout=15000)
+    try: page.wait_for_load_state('networkidle', timeout=20000)
+    except Exception: page.wait_for_timeout(1500)
+
+    found, pages, total = {}, 0, ''
+    seen_signatures = set()
+    for _ in range(MAX_PAGES_PER_KEYWORD):
+        try: total = total or parse_total_reported(clean(page.locator('body').inner_text(timeout=5000)))
+        except Exception: pass
+        before = set(found)
+        page_found = {}
+        collect_links(page, keyword, page_found)
+        sig = tuple(sorted(page_found))
+        if not sig or sig in seen_signatures:     # empty page or pagination stuck on same page
+            break
+        seen_signatures.add(sig)
+        found.update(page_found)
+        pages += 1
+        nxt = page.get_by_role('link', name=re.compile(r'^(Next|›|»)$', re.I)).last
+        if nxt.count() == 0:
+            nxt = page.locator('a[aria-label*="Next" i], button[aria-label*="Next" i], li.next a').last
+        if nxt.count() == 0 or not nxt.is_visible(): break
+        try:
+            cls = ((nxt.get_attribute('class') or '') + ' ' + (nxt.locator('xpath=..').get_attribute('class') or '')).lower()
+            if 'disabled' in cls or (nxt.get_attribute('aria-disabled') or '').lower() == 'true': break
+            nxt.click(timeout=5000)
+            page.wait_for_timeout(900)
+        except Exception:
+            break
+        if set(found) == before and pages > 1: break
+    return found, {'total_reported': total, 'links_found': len(found), 'pages': pages}
+
+
+# ----------------------------------------------------------------------------
+# DETAIL PAGE
+# ----------------------------------------------------------------------------
+LABELS = {norm(x) for x in [
+    'event id', 'event number', 'esource number', 'event title', 'opportunity title', 'solicitation number', 'reference number',
+    'agency', 'agency name', 'entity', 'entity name', 'government entity', 'event type', 'event status', 'purchase type',
+    'category type', 'government type', 'fiscal year', 'start date', 'end date', 'closing date', 'deadline date', 'description',
+    'event description', 'buyer contact', 'contact name', 'email', 'contact email', 'phone', 'telephone', 'address',
+    'estimated value', 'posted date', 'publish date', 'created date', 'date posted', 'ends in', 'link']}
+
 
 def label_value_map(page):
-    """Build conservative label/value pairs from actual DOM structure.
-
-    Do not zip flattened page text or shift values when cells are blank. Registry
-    pages sometimes render many label/value pairs in one row, so only recognized
-    labels followed by a non-label value are accepted.
-    """
     pairs = {}
-    labels = {
-        'event id','event number','esource number','event title','opportunity title',
-        'solicitation number','reference number','agency','agency name','entity',
-        'government entity','event type','event status','purchase type','category type',
-        'government type','fiscal year','start date','end date','closing date','deadline date',
-        'description','event description','buyer contact','contact name','email','contact email',
-        'phone','telephone','address','estimated value','posted date','publish date',
-        'created date','date posted','ends in','link'
-    }
-    normalized_labels = {norm(x) for x in labels}
+
     def add(k, v):
         k, v = clean(k).rstrip(':').strip(), clean(v)
-        if not k or not v or norm(k) not in normalized_labels or norm(v) in normalized_labels:
-            return
-        # Reject values which are obviously a run of subsequent labels.
-        if re.search(r'\b(?:Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year)\s+(?:Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year)\b', v, re.I):
-            return
-        pairs[k] = v
+        if not k or not v or norm(k) not in LABELS or norm(v) in LABELS: return
+        pairs.setdefault(k, v)
+
     for tr in page.locator('tr').all():
         try:
             cells = [clean(x).rstrip(':') for x in tr.locator('th,td').all_inner_texts()]
-            # Preserve cell positions; never discard empty cells before pairing.
             i = 0
             while i + 1 < len(cells):
-                if norm(cells[i]) in normalized_labels:
-                    add(cells[i], cells[i+1])
-                    i += 2
-                else:
-                    i += 1
-        except Exception:
-            pass
+                if norm(cells[i]) in LABELS: add(cells[i], cells[i + 1]); i += 2
+                else: i += 1
+        except Exception: pass
     for dt in page.locator('dt').all():
-        try:
-            key = clean(dt.inner_text()).rstrip(':')
-            val = clean(dt.locator('xpath=following-sibling::*[1]').inner_text())
-            add(key, val)
-        except Exception:
-            pass
+        try: add(dt.inner_text(), dt.locator('xpath=following-sibling::*[1]').inner_text())
+        except Exception: pass
     for lab in page.locator('label').all():
         try:
-            key = clean(lab.inner_text()).rstrip(':')
             target = lab.get_attribute('for')
-            val = clean(page.locator('#' + target).input_value()) if target else ''
-            add(key, val)
-        except Exception:
-            pass
+            add(lab.inner_text(), page.locator('#' + target).input_value() if target else '')
+        except Exception: pass
     return pairs
 
+
 def first_match(mapping, *terms):
-    """Match normalized labels exactly; fragments must never match other fields."""
     wanted = {norm(t) for t in terms if norm(t)}
     for k, v in mapping.items():
-        if norm(k) in wanted and clean(v):
-            return clean(v)
+        if norm(k) in wanted and clean(v): return clean(v)
     return ''
 
-def extract_event_id(url, mapping, text):
-    query = parse_qs(urlparse(url).query)
-    # eSourceNumber is the official stable event identifier; never use generic table text.
-    source_id = clean((query.get('eSourceNumber') or query.get('eventId') or [''])[0])
-    if source_id:
-        return source_id
-    for key, value in mapping.items():
-        if norm(key) in {'eventid', 'eventnumber', 'esourcenumber'}:
-            candidate = clean(value)
-            match = re.search(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\b', candidate, re.I)
-            if match:
-                return match.group(0)
-    match = re.search(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\b', text, re.I)
-    return match.group(0) if match else ''
 
-def scrape_search_keyword(page, keyword):
-    # Use the public registry landing page, not the old /index route.
-    page.goto(SEARCH_URL, wait_until='domcontentloaded', timeout=60000)
-    page.wait_for_timeout(1800)
-    current_url = page.url
-    body_preview = ''
+def section(text, label, stops=None):
+    """Text after `label` up to the next known label."""
+    stops = [s for s in (stops or LABEL_STOPS) if s.lower() != label.lower()]
+    pat = (rf'(?:^|\s){re.escape(label)}\s*:?\s*(.*?)(?=\s+(?:{"|".join(re.escape(s) for s in sorted(stops, key=len, reverse=True))})\s*:?(?:\s|$)|$)')
+    m = re.search(pat, text, re.I)
+    return clean(m.group(1)) if m else ''
+
+
+PHONE_RE = re.compile(r'(?<!\d)(?:\+?1[-. ]?)?\(?\d{3}\)?[-. ]?\d{3}[-. ]\d{4}(?:\s*(?:ext\.?|x|extension)\s*\d{1,6})?(?!\d)', re.I)
+EMAIL_RE = re.compile(r'[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}', re.I)
+
+
+def parse_contact(page, text, mapping):
+    """Buyer name / phone / email / address from mailto:/tel: links first, then the 'Buyer Contact' block."""
+    block = section(text, 'Buyer Contact') or first_match(mapping, 'buyercontact', 'contactname', 'buyername')
+    email = phone = ''
     try:
-        body_preview = clean(page.locator('body').inner_text(timeout=5000))[:1200]
+        for href in page.eval_on_selector_all('a[href^="mailto:" i]', 'els => els.map(e => e.getAttribute("href"))'):
+            e = clean(href.split(':', 1)[1].split('?')[0])
+            if EMAIL_RE.fullmatch(e): email = e; break
+        for href in page.eval_on_selector_all('a[href^="tel:" i]', 'els => els.map(e => e.getAttribute("href"))'):
+            p = clean(href.split(':', 1)[1])
+            if len(re.sub(r'\D', '', p)) >= 10: phone = p; break
     except Exception:
         pass
-    if '/unsupported' in current_url.lower() or 'unsupported browser' in body_preview.lower():
-        raise RuntimeError(f'GPR returned unsupported-browser page at {current_url}; page text: {body_preview[:500]}')
-    # Match the visible field labelled Search Keyword; fall back to a text input.
-    field = page.get_by_placeholder(re.compile('Enter Event ID or Title', re.I)).first
-    if field.count()==0: field=page.locator('input[type="text"]').first
-    field.fill(keyword)
-    # Keep Event Status OPEN (as requested). Select by visible option where possible.
-    for sel in page.locator('select').all():
+    email = email or first_match(mapping, 'email', 'contactemail')
+    phone = phone or first_match(mapping, 'phone', 'telephone', 'contactphone')
+    if not email:
+        m = EMAIL_RE.search(block) or EMAIL_RE.search(text)
+        email = m.group(0) if m else ''
+    if not phone:
+        m = PHONE_RE.search(block) or PHONE_RE.search(text)
+        phone = clean(m.group(0)) if m else ''
+    if re.search(r'555[-. ]?555[-. ]?\d{4}', phone) or re.sub(r'\D', '', phone) in {'0000000000', '5555555555'}:
+        phone = ''
+    # name & address from the block with phone/email removed
+    rest = block
+    for tok in (email, phone):
+        if tok: rest = rest.replace(tok, ' ')
+    rest = clean(re.sub(r'\b(?:Phone|Tel(?:ephone)?|E-?mail|Fax|Contact|Address)\s*:', ' | ', rest, flags=re.I)).strip(' |')
+    name = address = ''
+    m = re.match(r"([A-Za-z][A-Za-z.'\-, ]{1,80}?)(?=\s+\d|\s*\||\s*$)", rest)
+    if m:
+        name = clean(m.group(1)).strip(' ,')
+        address = clean(rest[m.end():]).strip(' |,')
+    address = first_match(mapping, 'address', 'buyeraddress', 'contactaddress') or address
+    if len(address) > 250 or re.search(r'\b(Event Type|Event Status|Purchase Type)\b', address): address = ''
+    if name and EMAIL_RE.search(name): name = ''
+    return {'name': name, 'phone': phone, 'email': email, 'address': address}
+
+
+def extract_event_id(url, mapping, text):
+    q = parse_qs(urlparse(url).query)
+    sid = clean((q.get('eSourceNumber') or q.get('eventId') or [''])[0])
+    if sid: return sid
+    for k, v in mapping.items():
+        if norm(k) in {'eventid', 'eventnumber', 'esourcenumber'}:
+            m = re.search(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\b', clean(v), re.I)
+            if m: return m.group(0)
+    m = re.search(r'\b[A-Z]{2}-[A-Z0-9-]{8,}\b', text, re.I)
+    return m.group(0) if m else ''
+
+
+def extract_title(page, text, mapping):
+    for sel in ['h1', 'h2', 'h3', '.page-title', '.event-title']:
         try:
-            opts=[clean(x) for x in sel.locator('option').all_inner_texts()]
-            if any(x.upper()=='OPEN' for x in opts): sel.select_option(label=re.compile('OPEN', re.I))
+            for c in page.locator(sel).all_inner_texts():
+                c = clean(c)
+                if re.match(r'^(RFP|RFQ|RFI|ITB|IFB|RFx|RFB|SWC|IRFP)\s*[-#:]?\s*\w+', c, re.I) and len(c) >= 10:
+                    return c
         except Exception: pass
-    btn=page.get_by_role('button', name=re.compile('^Search$', re.I)).first
-    if btn.count()==0: btn=page.locator('input[type="submit"]').first
-    btn.click(timeout=15000)
-    page.wait_for_load_state('domcontentloaded', timeout=30000)
-    page.wait_for_timeout(800)
-    found={}
-    for page_no in range(MAX_PAGES_PER_KEYWORD):
-        links=page.locator('a[href*="eventDetails" i], a[href*="eventdetails" i], a[href*="eSourceNumber" i]')
-        for i in range(links.count()):
-            try:
-                href=links.nth(i).get_attribute('href')
-                if href:
-                    url=urljoin(page.url, href)
-                    # Keep the original public URL format used by the registry; pur.doas links also work.
-                    if '/gpr/eventDetails' in url and 'ssl.doas.state.ga.us' not in url:
-                        url = url.replace('https://pur.doas.ga.gov/gpr/', BASE_URL)
-                    # stable key: canonical event URL query, preserve actual official URL
-                    key=parse_qs(urlparse(url).query).get('eSourceNumber',[url])[0]
-                    found[key]={'url':url,'keyword':keyword}
-            except Exception: pass
-        # Try common next-page controls; stop when none is enabled.
-        nxt=page.get_by_role('link', name=re.compile('^(Next|›|»)$', re.I)).last
-        if nxt.count()==0:
-            nxt=page.locator('a[aria-label*="Next"], button[aria-label*="Next"]').last
-        if nxt.count()==0 or not nxt.is_visible(): break
-        try:
-            cls=(nxt.get_attribute('class') or '').lower(); aria=(nxt.get_attribute('aria-disabled') or '').lower()
-            if 'disabled' in cls or aria=='true': break
-            nxt.click(timeout=5000); page.wait_for_timeout(500)
-        except Exception: break
-    return found
-
-def text_label_value(text, label, stop_labels):
-    """Extract a value between a visible label and the next known label."""
-    stops = '|'.join(re.escape(x) for x in sorted(stop_labels, key=len, reverse=True))
-    pattern = rf'(?:^|\s){re.escape(label)}\s*:?\s*(.*?)(?=\s+(?:{stops})\s*:?\s*|$)'
-    match = re.search(pattern, text, re.I)
-    return clean(match.group(1)) if match else ''
+    m = re.search(r'((?:RFP|RFQ|RFI|ITB|IFB|RFx|RFB)\s*[-#]?\s*[A-Z0-9][A-Z0-9-]*\s*[-:–—]\s*.{4,220}?)'
+                  r'(?=\s+(?:Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year|Start Date|End Date|Ends In|Event Details|Documents)\b|$)', text, re.I)
+    if m: return clean(m.group(1))
+    return first_match(mapping, 'eventtitle', 'opportunitytitle', 'solicitationtitle', 'title')
 
 
-def extract_event_metadata(text, url, mapping):
-    labels = [
-        'Event Type', 'Event Status', 'Purchase Type', 'Category Type',
-        'Government Type', 'Fiscal Year', 'Start Date', 'End Date',
-        'Buyer Contact', 'Description'
-    ]
-    result = {}
-    # Prefer exact label/value pairs from the DOM; flattened-text parsing is fallback.
-    aliases = {
-        'Event Type': ('eventtype',),
-        'Event Status': ('eventstatus',),
-        'Purchase Type': ('purchasetype',),
-        'Category Type': ('categorytype',),
-        'Government Type': ('governmenttype',),
-        'Fiscal Year': ('fiscalyear',),
-        'Start Date': ('startdate', 'eventstart'),
-        'End Date': ('enddate', 'closingdate', 'duedate', 'deadline'),
-        'Description': ('description', 'eventdescription', 'scope'),
-        'Buyer Contact': ('buyercontact', 'contactname', 'buyername')
-    }
-    for label in labels:
-        from_text = text_label_value(text, label, labels + ['Ends In', 'Event Details', 'Documents', 'Link'])
-        exact = ''
-        for key, value in mapping.items():
-            if norm(key) in aliases.get(label, ()) and clean(value):
-                candidate = clean(value)
-                # Never accept a field label itself as the value of another field.
-                if norm(candidate) not in {norm(x) for x in labels + ['Ends In', 'Event Details', 'Documents', 'Link']}:
-                    exact = candidate
-                    break
-        result[label] = from_text or exact
+def extract_agency(text, mapping):
+    bad = re.compile(r'\b(Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year|Link)\b', re.I)
+    cand = first_match(mapping, 'agency', 'agencyname', 'entity', 'entityname', 'governmententity')
+    cand = re.sub(r'^\d{5}\s+', '', cand)
+    if cand and len(cand) < 180 and not bad.search(cand) and ' | ' not in cand:
+        return cand
+    m = re.search(r'\b\d{5}\s+([A-Z][A-Z0-9&.,() /\'-]{2,100}?)(?=\s+(?:Buyer Contact|Description|Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year|Link|RFP|RFQ|RFI|ITB|IFB|RFx)\b|$)', text)
+    if m and not bad.search(m.group(1)): return clean(m.group(1))
+    return ''
 
-    status_match = re.search(
-        r'\bEvent Status\s*:?\s*(Open|Closed|Cancelled|Canceled|Awarded|Evaluated|Pending|Draft)\b',
-        text, re.I
-    )
-    if status_match:
-        result['Event Status'] = status_match.group(1).title()
 
-    result['Event ID'] = extract_event_id(url, mapping, text)
+def extract_agency_site_url(page, title, ref):
+    best, best_score = '', 0
+    ref_slug = re.sub(r'[^a-z0-9]+', '-', ref.lower()).strip('-')
+    words = [w for w in re.findall(r'[a-z0-9]+', title.lower()) if len(w) >= 5]
+    try:
+        for a in page.locator('a[href]').all():
+            href = (a.get_attribute('href') or '').strip()
+            if not href or href.startswith(('#', 'javascript:', 'mailto:', 'tel:')) or 'eventdetails' in href.lower(): continue
+            absolute = urljoin(page.url, href)
+            pu = urlparse(absolute)
+            if pu.scheme not in {'http', 'https'}: continue
+            if pu.netloc.endswith(('doas.state.ga.us', 'doas.ga.gov')) and 'download' not in absolute.lower(): continue
+            if pu.path.rstrip('/').lower() in {'', '/', '/opportunities', '/procurement/opportunities', '/gpr'}: continue
+            try: label = clean(a.inner_text(timeout=500))
+            except Exception: label = ''
+            hay = (label + ' ' + href).lower()
+            score = 3 + (10 if ref_slug and ref_slug in re.sub(r'[^a-z0-9]+', '-', hay) else 0) + sum(2 for w in words if w in hay)
+            if score > best_score: best, best_score = absolute, score
+    except Exception:
+        logging.exception('agency-site URL extraction failed')
+    return best
 
-    # Titles are commonly displayed as "RFP828 - ...".
-    title_match = re.search(
-        r'\b((?:RFP|RFQ|RFI|ITB|IFB|RFx)\s*[-#]?\s*[A-Z0-9][A-Z0-9-]*\s*[-:–—]\s*.+?)(?=\s+Start Date\s*:|\s+End Date\s*:|\s+Event Details\b)',
-        text, re.I
-    )
-    if title_match:
-        result['Opportunity Title'] = clean(title_match.group(1))
-
-    # Prefer a direct Agency/Entity label if it contains a clean value.
-    agency = ''
-    for key, value in mapping.items():
-        if norm(key) in {'agency', 'agencyname', 'entity', 'entityname', 'governmententity'}:
-            candidate = clean(value)
-            candidate = re.sub(r'^\d{5}\s+', '', candidate)
-            if candidate and len(candidate) < 180 and not re.search(
-                r'\b(Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year|Link)\b',
-                candidate, re.I
-            ) and ' | ' not in candidate:
-                agency = candidate
-                break
-    # On this registry layout the agency often follows a 5-digit entity code.
-    if not agency:
-        entity_match = re.search(
-            r'\b\d{5}\s+(ATLANTA REGIONAL COMMISSION|[A-Z][A-Z0-9&.,() /\'-]{2,100}?)(?=\s+(?:Buyer Contact|Description|Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year|Link)\b)',
-            text, re.I
-        )
-        if entity_match:
-            agency = clean(entity_match.group(1))
-    if not agency:
-        # Fallback: stop the uppercase agency name at the next known registry label.
-        entity_match = re.search(
-            r'\b\d{5}\s+([A-Z][A-Z0-9&.,() /\'-]{2,100}?)(?=\s+(?:RFP|RFQ|RFI|ITB|IFB|RFx)\b|\s+Buyer Contact\b|\s+Description\b|$)',
-            text, re.I
-        )
-        if entity_match:
-            candidate = clean(entity_match.group(1))
-            if not re.search(r'\b(Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year|Link)\b', candidate, re.I):
-                agency = candidate
-    if agency:
-        result['Agency'] = agency
-    return result
 
 def scrape_details(page, url, keywords):
-    page.goto(url, wait_until='domcontentloaded', timeout=60000)
-    page.wait_for_timeout(500)
-    text=clean(page.locator('body').inner_text(timeout=15000))
-    mapping=label_value_map(page)
-    metadata=extract_event_metadata(text, url, mapping)
-    event_id=metadata.get('Event ID') or extract_event_id(url,mapping,text)
-    # The visible page heading is the authoritative opportunity title (e.g. RFP828 - ...).
-    title=''
-    for sel in ['h1','h2','h3','.page-title','.event-title']:
-        try:
-            candidates=page.locator(sel).all_inner_texts()
-            for candidate in candidates:
-                candidate=clean(candidate)
-                if re.match(r'^(RFP|RFQ|RFI|ITB|IFB|RFx)\s*[-#:]?\s*\w+', candidate, re.I) and len(candidate) >= 10:
-                    title=candidate
-                    break
-            if title: break
-        except Exception: pass
-    if not title:
-        # Registry page sometimes renders the title as a non-heading element.
-        m=re.search(
-            r'((?:RFP|RFQ|RFI|ITB|IFB|RFx)\s*[-#]?\s*[A-Z0-9][A-Z0-9-]*\s*[-:–—]\s*.{4,220}?)'
-            r'(?=\s+(?:Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year|Start Date|End Date|Ends In|Event Details|Documents)\b|$)',
-            text, re.I
-        )
-        if m: title=clean(m.group(1))
-    if not title:
-        title=metadata.get('Opportunity Title','')
-    if not title:
-        title=first_match(mapping,'eventtitle','opportunitytitle','solicitationtitle','title')
-    # Always initialize agency independently of title extraction.
-    agency=metadata.get('Agency','') or first_match(mapping,'agency','governmententity','entityname','agencyname')
-    if re.search(r'\b(Event Type|Event Status|Purchase Type|Category Type|Government Type|Fiscal Year)\b', agency, re.I) or ' | ' in agency:
-        agency = ''
-    if not agency:
-        m=re.search(r'\b\d{5}\s+([A-Z][A-Z0-9 ,&().\-/]+?)(?:\s+Buyer Contact:|\s+Description)',text)
-        if m: agency=clean(m.group(1))
-    status=metadata.get('Event Status','')
-    if status.lower() not in {'open','closed','cancelled','canceled','awarded','evaluated','pending','draft'}:
-        status = ''
-    if not status:
-        status_match = re.search(r'\bEvent Status\s*:?\s*(Open|Closed|Cancelled|Canceled|Awarded|Evaluated|Pending|Draft)\b', text, re.I)
-        status = status_match.group(1).title() if status_match else ''
-    purchase_type=metadata.get('Purchase Type','') or first_match(mapping,'purchasetype')
-    category_type=metadata.get('Category Type','') or first_match(mapping,'categorytype')
-    government_type=metadata.get('Government Type','') or first_match(mapping,'governmenttype')
-    fiscal_year=metadata.get('Fiscal Year','') or first_match(mapping,'fiscalyear')
-    event_type=metadata.get('Event Type','') or first_match(mapping,'eventtype')
-    start=first_match(mapping,'startdate','eventstart')
-    end=first_match(mapping,'enddate','closingdate','duedate','deadline')
-    start_match=re.search(r'Start Date:\s*(.*?)(?:\s+End Date:|$)',text,re.I)
-    end_match=re.search(r'End Date:\s*(.*?)(?:\s+Ends In:|\s+Event Details|$)',text,re.I)
-    if start_match: start=clean(start_match.group(1))
-    if end_match: end=clean(end_match.group(1))
-    if not end:
-        m=re.search(r'(?:End Date|Closing Date|Deadline Date)[: ]+([^\n]{5,100})', text, re.I)
-        if m: end=clean(m.group(1))
-    contact_name=first_match(mapping,'buyercontact','contactname','buyername')
-    if not contact_name:
-        m=re.search(r'Buyer Contact:\s*([^\d\n]+?)(?=\s+\d{3}[-.)]|\s+[\w.+-]+@[\w.-]+|$)',text,re.I)
-        if m: contact_name=clean(m.group(1))
-    email=first_match(mapping,'email','contactemail')
-    if not email:
-        m=re.search(r'[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}',text,re.I); email=m.group(0) if m else ''
-    phone=first_match(mapping,'phone','telephone','contactphone')
-    if not phone:
-        m=re.search(r'(?<!\d)(?:\+?1[-. ]?)?\(?\d{3}\)?[-. ]\d{3}[-. ]\d{4}(?!\d)',text); phone=m.group(0) if m else ''
-        if re.sub(r'\D','',phone) in {'5555555555','0000000000'} or re.search(r'555[-. ]?555[-. ]?\d{4}', phone): phone=''
-    desc=first_match(mapping,'description','eventdescription','scope')
-    if not desc:
-        m=re.search(r'Description\s+(.*?)(?:\s+NIGP Codes|\s+Documents|\s+Procurement Help Desk)',text,re.I)
-        desc=clean(m.group(1)) if m else ''
-    pub=first_match(mapping,'posteddate','publishdate','createddate','dateposted')
-    value=first_match(mapping,'estimatedvalue','eventvalue','totalvalue')
-    category=category_type or first_match(mapping,'category','purchasetype','eventtype')
-    event_type=event_type or first_match(mapping,'type of response','response type')
-    address=first_match(mapping,'address','buyeraddress','contactaddress')
-    # Resolve solicitation reference before URL scoring (the old ordering raised
-    # UnboundLocalError and silently skipped the agency-site URL extraction).
-    ref_match = re.search(r'\b(?:RFP|RFQ|RFI|ITB|IFB|RFx)\s*[-#]?\s*[A-Z0-9][A-Z0-9-]*', title, re.I)
-    solicitation_ref = clean(ref_match.group(0)) if ref_match else ''
-    # Prefer event-specific external links; do not store a generic opportunities index.
-    agency_site_url = ''
-    try:
-        candidates = []
-        ref_slug = re.sub(r'[^a-z0-9]+', '-', solicitation_ref.lower()).strip('-')
-        title_words = [w for w in re.findall(r'[a-z0-9]+', title.lower()) if len(w) >= 5]
-        for a in page.locator('a[href]').all():
-            label = clean(a.inner_text(timeout=500))
-            href = (a.get_attribute('href') or '').strip()
-            if not href or href.startswith(('#', 'javascript:')) or 'eventdetails' in href.lower():
-                continue
-            absolute = urljoin(page.url, href)
-            parsed = urlparse(absolute)
-            if parsed.scheme not in {'http', 'https'}:
-                continue
-            path = parsed.path.rstrip('/').lower()
-            if path in {'', '/', '/opportunities', '/procurement/opportunities', '/gpr'}:
-                continue
-            searchable = (label + ' ' + href).lower()
-            score = 3
-            if ref_slug and ref_slug in re.sub(r'[^a-z0-9]+', '-', searchable):
-                score += 10
-            score += sum(2 for word in title_words if word in searchable)
-            if label.lower() in {'link', 'view opportunity', 'solicitation details'}:
-                score += 1
-            candidates.append((score, absolute))
-        if candidates:
-            agency_site_url = max(candidates, key=lambda x: x[0])[1]
-    except Exception:
-        logging.exception('Could not extract agency-specific opportunity URL')
+    with_retries(lambda: page.goto(url, wait_until='domcontentloaded', timeout=60000), f'detail {url}')
+    try: page.wait_for_load_state('networkidle', timeout=15000)
+    except Exception: page.wait_for_timeout(1200)
+    text = clean(page.locator('body').inner_text(timeout=15000))
+    mapping = label_value_map(page)
 
-    # Explicitly extract the visible countdown shown beside the end date.
-    days_until=''
-    dm=re.search(r'Ends In:\s*(\d+)\s*days?', text, re.I)
-    if dm:
-        days_until=dm.group(1)
-    if not days_until and end:
-        date_match = re.search(r'(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+20\d{2}', end, re.I)
-        if date_match:
-            try:
-                deadline_dt = datetime.strptime(date_match.group(0).replace(',', ''), '%b %d %Y')
-                days_until = str((deadline_dt.date() - datetime.now().date()).days)
-            except ValueError:
-                pass
-    event_id=event_id or ''
-    # The solicitation/reference number is commonly embedded in the title (e.g. RFP828),
-    # while Event ID is the longer eSourceNumber. Keep these as separate fields.
-    # Prefer a real end-date time if available; do not duplicate the whole date into the time column.
-    deadline_time = ''
-    tm = re.search(r'\b(\d{1,2}:\d{2}\s*(?:AM|PM)?\s*(?:ET|EST|EDT|CT|CST|CDT|MT|MST|MDT|PT|PST|PDT|UTC)?)\b', end, re.I)
-    if tm:
-        deadline_time = clean(tm.group(1))
+    event_id = extract_event_id(url, mapping, text)
+    title = extract_title(page, text, mapping)
+    agency = extract_agency(text, mapping)
+
+    st = re.search(r'\bEvent Status\s*:?\s*(Open|Closed|Cancelled|Canceled|Awarded|Evaluated|Pending|Draft)\b', text, re.I)
+    status = st.group(1).title() if st else first_match(mapping, 'eventstatus').title()
+    if status.lower() not in VALID_STATUSES: status = ''
+
+    def field(label, *aliases):
+        v = section(text, label)
+        if norm(v) in LABELS or len(v) > 150: v = ''
+        return v or first_match(mapping, *aliases)
+
+    event_type = field('Event Type', 'eventtype')
+    purchase_type = field('Purchase Type', 'purchasetype')
+    category_type = field('Category Type', 'categorytype')
+    government_type = field('Government Type', 'governmenttype')
+    fiscal_year = field('Fiscal Year', 'fiscalyear')
+
+    start_raw = section(text, 'Start Date') or first_match(mapping, 'startdate', 'eventstart')
+    end_raw = section(text, 'End Date') or first_match(mapping, 'enddate', 'closingdate', 'duedate', 'deadline', 'deadlinedate')
+    pub_raw = first_match(mapping, 'posteddate', 'publishdate', 'createddate', 'dateposted')
+    end_d, end_t, end_tz = parse_date_time(end_raw)
+    pub_d, _, _ = parse_date_time(pub_raw)
+    deadline_date = end_d.isoformat() if end_d else end_raw
+    deadline_time = clean(f'{end_t} {end_tz}')
+    days_until = ''
+    if end_d:
+        days_until = str((end_d - datetime.now(TZ).date()).days)
+    else:
+        dm = re.search(r'Ends In:\s*(-?\d+)\s*days?', text, re.I)
+        if dm: days_until = dm.group(1)
+
+    desc = section(text, 'Description') or first_match(mapping, 'description', 'eventdescription', 'scope')
+    contact = parse_contact(page, text, mapping)
+    value = first_match(mapping, 'estimatedvalue', 'eventvalue', 'totalvalue')
+
+    rm = re.search(r'\b(?:RFP|RFQ|RFI|ITB|IFB|RFx|RFB)\s*[-#]?\s*[A-Z0-9][A-Z0-9-]*', title, re.I)
+    solicitation_ref = clean(rm.group(0)) if rm else ''
+    agency_site_url = extract_agency_site_url(page, title, solicitation_ref)
+
+    links = f'Event details: {url}#pane-eventDetails\nDocuments: {url}#pane-documents'
+    scope = (desc[:3500] + '\n' + links) if desc else links
+    found_contact = any(contact.values())
+
     return {
-      'Opportunity ID':event_id or hashlib.sha1(url.encode()).hexdigest()[:12].upper(), 'Date Found':'', 'State':'Georgia',
-      'Agency':agency,'Opportunity Title':title,'Solicitation / Reference No.':solicitation_ref,'Opportunity Type':event_type or category,
-      'Service Category':category,'Official Source URL':url,'Agency Site URL':agency_site_url,'Event ID':event_id,'Event Type':event_type,'Event Status':status,'Purchase Type':purchase_type,'Category Type':category_type,'Government Type':government_type,'Fiscal Year':fiscal_year,'Published Date':pub,'Deadline Date':end,'Deadline Time / Time Zone':deadline_time,'Days Until Deadline':days_until,
-      'Estimated Value (if published)':value,'Scope Summary':(desc[:3500] + ('\nEvent details: '+url+'#pane-eventDetails\nDocuments: '+url+'#pane-documents') if desc else 'Event details: '+url+'#pane-eventDetails\nDocuments: '+url+'#pane-documents'), 'Eligibility / Mandatory Requirements':'',
-      'Required Certifications / Experience':'','Contract Duration / Options':'','Incumbent / Prior Award (verified only)':'',
-      'Healthcare IT Fit (0-25)':'','Eligibility & Compliance (0-20)':'','Customer / Contract Fit (0-15)':'',
-      'Delivery Capability (0-15)':'','Deadline Feasibility (0-10)':'','Commercial Attractiveness (0-10)':'',
-      'Information Completeness (0-5)':'','Total Score (0-100)':'','Mandatory Gate (Pass / Fail / Unknown)':'Unknown',
-      'Recommendation (Go / Investigate / No-Go)':'Investigate','Fit Rationale':'Automated keyword discovery; human review required.',
-      'Risks / Gaps':'Confirm healthcare/IT relevance, requirements, deadline and eligibility in the official event documents.',
-      'Next Action':'Open official event; review documents and complete scoring.','Last Verified Date':datetime.now().strftime('%Y-%m-%d'),
-      'Owner':'','Review Status':'Needs Review','Reviewer Notes':'','Search Keywords Matched':'; '.join(sorted(set(keywords))),
-      'First Seen Date':'','Last Seen Date':'','Event Start Date/Time':start,'Buyer Contact Name':contact_name,
-      'Buyer Contact Phone':phone,'Buyer Contact Email':email,'Buyer Contact Address':address,
-      'Contact Extraction Status':'Contact found' if (contact_name or phone or email) else 'Not found on page',
-      'Last Updated At':datetime.now().isoformat(timespec='seconds'),'Record Hash':''}
+        'Opportunity ID': event_id or hashlib.sha1(url.encode()).hexdigest()[:12].upper(), 'State': 'Georgia',
+        'Agency': agency, 'Opportunity Title': title, 'Solicitation / Reference No.': solicitation_ref,
+        'Opportunity Type': event_type or category_type, 'Service Category': category_type,
+        'Official Source URL': url, 'Agency Site URL': agency_site_url, 'Event ID': event_id, 'Event Type': event_type,
+        'Event Status': status, 'Purchase Type': purchase_type, 'Category Type': category_type, 'Government Type': government_type,
+        'Fiscal Year': fiscal_year, 'Published Date': pub_d.isoformat() if pub_d else pub_raw,
+        'Deadline Date': deadline_date, 'Deadline Time / Time Zone': deadline_time, 'Days Until Deadline': days_until,
+        'Estimated Value (if published)': value, 'Scope Summary': scope,
+        'Mandatory Gate (Pass / Fail / Unknown)': 'Unknown', 'Recommendation (Go / Investigate / No-Go)': 'Investigate',
+        'Fit Rationale': 'Automated keyword discovery; human review required.',
+        'Risks / Gaps': 'Confirm healthcare/IT relevance, requirements, deadline and eligibility in the official event documents.',
+        'Next Action': 'Open official event; review documents and complete scoring.',
+        'Last Verified Date': today_str(), 'Review Status': 'Needs Review',
+        'Search Keywords Matched': '; '.join(sorted({k.strip() for k in keywords if k.strip()})),
+        'Event Start Date/Time': start_raw,
+        'Buyer Contact Name': contact['name'], 'Buyer Contact Phone': contact['phone'],
+        'Buyer Contact Email': contact['email'], 'Buyer Contact Address': contact['address'],
+        'Contact Extraction Status': 'Contact found' if found_contact else 'Not found on page',
+        'Last Updated At': now_iso(),
+        '_page_text': text[:6000],            # only used for debug output, stripped before saving
+    }
 
-def is_complete_record(row):
-    """
-    A record belongs in Tracker when the core opportunity data was extracted.
-    Optional fields such as buyer phone, buyer email, estimated value, agency site URL,
-    certifications, and contract duration may legitimately be absent from the public page.
-    Missing core fields route the record to Manual Review for human verification.
-    """
-    title = clean(row.get('Opportunity Title', ''))
-    agency = clean(row.get('Agency', ''))
-    event_id = clean(row.get('Event ID', ''))
-    deadline = clean(row.get('Deadline Date', ''))
-    scope = clean(row.get('Scope Summary', ''))
-    status = clean(row.get('Event Status', ''))
-    url = clean(row.get('Official Source URL', ''))
 
-    invalid_title = (not title or title.lower() in {'event', 'announcement', 'untitled'}
-                     or len(title) < 8)
-    invalid_agency = not agency or agency.lower() in {'unknown', 'n/a', 'none', 'agency'}
-    has_event_id = bool(event_id and event_id.lower() not in {'event', 'unknown', 'n/a'})
-    has_deadline = bool(deadline and re.search(
-        r'20\d{2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec', deadline, re.I))
-    has_scope = bool(scope and len(re.sub(r'https?://\S+', '', scope).strip()) >= 30)
-    has_status = status.lower() in {'open', 'closed', 'cancelled', 'canceled', 'awarded', 'evaluated', 'pending', 'draft'}
-    valid_url = 'eventdetails' in url.lower() and 'esourcenumber=' in url.lower()
-    # An Event ID like the word "Event" is invalid even if the title/deadline look good.
-    valid_event_id = bool(re.fullmatch(r'[A-Z]{2}-[A-Z0-9-]{8,}', event_id, re.I))
+# ----------------------------------------------------------------------------
+# VALIDATION / CHANGE DETECTION
+# ----------------------------------------------------------------------------
+def validate_record(row):
+    """Return (blocking_reasons, optional_missing). Blocking reasons => Manual Review."""
+    reasons, optional = [], []
+    title, agency = clean(row.get('Opportunity Title')), clean(row.get('Agency'))
+    url, eid = clean(row.get('Official Source URL')), clean(row.get('Event ID'))
+    if not url or 'eventdetails' not in url.lower() or 'esourcenumber=' not in url.lower():
+        reasons.append('Official Source URL missing/invalid')
+    if not title or title.lower() in {'event', 'announcement', 'untitled'} or len(title) < 8:
+        reasons.append('Opportunity Title missing/invalid')
+    if not agency or agency.lower() in {'unknown', 'n/a', 'none', 'agency'}:
+        reasons.append('Agency missing')
+    if not re.fullmatch(r'[A-Z]{2}-[A-Z0-9-]{8,}', eid, re.I):
+        reasons.append('Event ID missing/invalid')
+    if not re.search(r'20\d{2}', clean(row.get('Deadline Date'))):
+        reasons.append('Deadline Date missing/unparseable')
+    if len(re.sub(r'(Event details|Documents):\s*https?://\S+', '', clean(row.get('Scope Summary'))).strip()) < 30:
+        reasons.append('Scope/Description missing or too short')
+    if clean(row.get('Event Status')).lower() not in VALID_STATUSES:
+        reasons.append('Event Status missing/unrecognised')
+    for col, label in [('Buyer Contact Name', 'Buyer name'), ('Buyer Contact Phone', 'Buyer phone'),
+                       ('Buyer Contact Email', 'Buyer email'), ('Buyer Contact Address', 'Buyer address'),
+                       ('Agency Site URL', 'Agency site URL'), ('Published Date', 'Published date'),
+                       ('Deadline Time / Time Zone', 'Deadline time')]:
+        if not clean(row.get(col)): optional.append(label)
+    return reasons, optional
 
-    return all([not invalid_title, not invalid_agency, valid_event_id,
-                has_deadline, has_scope, has_status, valid_url])
 
-def export_data(records, review_records, diagnostics):
+def detect_changes(prior, new):
+    changes = []
+    for col in CHANGE_FIELDS:
+        old, cur = clean(prior.get(col, '')), clean(new.get(col, ''))
+        if old != cur:
+            changes.append(f"{col}: '{old[:60]}' -> '{cur[:60]}'")
+    return changes
+
+
+def merge_with_prior(row, prior, seen_today):
+    """Apply human-entered values, keep good old data if extraction came back blank, and track website changes."""
+    # keep previously good scraped values when this run could not extract them (never wipe on a flaky page)
+    for col in CHANGE_FIELDS + ['Solicitation / Reference No.', 'Event Type', 'Purchase Type', 'Category Type',
+                                 'Government Type', 'Fiscal Year', 'Days Until Deadline']:
+        if not clean(row.get(col, '')) and clean(prior.get(col, '')) and col != 'Days Until Deadline':
+            row[col] = prior[col]
+    for col in HUMAN_FIELDS:
+        if clean(prior.get(col, '')): row[col] = prior[col]
+    first = clean(prior.get('Date Found')) or clean(prior.get('Date Added to Review')) or today_str()
+    row['Date Found'] = first
+    row['Date Added to Review'] = clean(prior.get('Date Added to Review')) or clean(prior.get('Date Found')) or today_str()
+    row['First Seen Date'] = clean(prior.get('First Seen Date')) or first
+    row['Last Seen Date'] = today_str() if seen_today else (clean(prior.get('Last Seen Date')) or today_str())
+    # union of keywords
+    kws = {k.strip() for k in (clean(prior.get('Search Keywords Matched')) + ';' + clean(row.get('Search Keywords Matched'))).split(';') if k.strip()}
+    row['Search Keywords Matched'] = '; '.join(sorted(kws))
+    changes = detect_changes(prior, row) if prior else []
+    if changes:
+        row['Last Changed Date'] = today_str()
+        row['Change Summary'] = (today_str() + ': ' + ' | '.join(changes))[:1500]
+        logging.info('CHANGED %s: %s', row.get('Event ID'), '; '.join(changes)[:300])
+    else:
+        row['Last Changed Date'] = clean(prior.get('Last Changed Date'))
+        row['Change Summary'] = clean(prior.get('Change Summary'))
+    row['Record Hash'] = hash_record(row)
+    return row
+
+
+# ----------------------------------------------------------------------------
+# EXPORT
+# ----------------------------------------------------------------------------
+def export_data(tracker_rows, review_rows, diagnostics):
     os.makedirs('data', exist_ok=True)
-    for basename, rows in [('georgia_leads', records), ('georgia_manual_review', review_records)]:
+    for basename, rows, base_cols in [('georgia_leads', tracker_rows, TRACKER_HEADERS),
+                                      ('georgia_manual_review', review_rows, REVIEW_HEADERS)]:
+        rows = [{k: v for k, v in r.items() if not k.startswith('_')} for r in rows]
+        cols = list(base_cols)                     # copy: never mutate the global header lists
+        for r in rows:
+            for k in r:
+                if k not in cols: cols.append(k)
         with open(f'data/{basename}.json', 'w', encoding='utf-8') as f:
             json.dump(rows, f, ensure_ascii=False, indent=2)
-        columns = TRACKER_HEADERS if basename == 'georgia_leads' else REVIEW_HEADERS
-        for row in rows:
-            for key in row.keys():
-                if key not in columns:
-                    columns.append(key)
         with open(f'data/{basename}.csv', 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.DictWriter(f, fieldnames=columns, extrasaction='ignore')
-            writer.writeheader()
-            writer.writerows(rows)
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
+            w.writeheader(); w.writerows(rows)
     with open('data/georgia_diagnostics.json', 'w', encoding='utf-8') as f:
         json.dump(diagnostics, f, ensure_ascii=False, indent=2)
 
+
+# ----------------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------------
 def main():
-    tracker, review=get_google_sheets()
-    tracker_headers=ensure_headers(tracker,TRACKER_HEADERS)
-    review_headers=ensure_headers(review,REVIEW_HEADERS)
-    _, old_tracker=rows_as_dicts(tracker)
-    _, old_review=rows_as_dicts(review)
-    old_by_id={clean(r.get('Opportunity ID','')):r for r in old_tracker if clean(r.get('Opportunity ID',''))}
-    # Refresh records already in either worksheet, not only records currently in Tracker.
+    run_started = datetime.now(timezone.utc)
+    tracker, review, log_ws = get_google_sheets()
+    tracker_headers = ensure_headers(tracker, TRACKER_HEADERS)
+    review_headers = ensure_headers(review, REVIEW_HEADERS)
+    ensure_headers(log_ws, KEYWORD_LOG_HEADERS)
+
+    _, old_tracker = rows_as_dicts(tracker)
+    _, old_review = rows_as_dicts(review)
     old_all = old_tracker + old_review
-    old_by_url = {clean(r.get('Official Source URL','')).split('#')[0]: r
-                  for r in old_all if clean(r.get('Official Source URL',''))}
-    found={}; failures=[]
+    prior_by_id, prior_by_url = {}, {}
+    for r in old_all:
+        for k in ('Event ID', 'Opportunity ID'):
+            if clean(r.get(k)): prior_by_id.setdefault(clean(r[k]), r)
+        if url_key(r.get('Official Source URL', '')): prior_by_url.setdefault(url_key(r['Official Source URL']), r)
+
+    def find_prior(event_id, url):
+        return prior_by_id.get(clean(event_id)) or prior_by_url.get(url_key(url)) or {}
+
+    found, failures, keyword_stats, log_rows = {}, [], [], []
+    detail_failures, skipped_not_open = [], 0
+    records = []
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+
     with sync_playwright() as p:
-        browser=p.chromium.launch(headless=True)
-        context=browser.new_context(
-            viewport={'width':1440,'height':1000},
-            locale='en-US',
-            timezone_id='America/New_York',
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            viewport={'width': 1440, 'height': 1000}, locale='en-US', timezone_id='America/New_York',
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-            extra_http_headers={'Accept-Language':'en-US,en;q=0.9'},
-        )
-        page=context.new_page()
-        for i,keyword in enumerate(KEYWORDS,1):
+            extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'})
+        page = context.new_page()
+
+        # ---- 1. search every keyword (Event Status = OPEN) and record how many opportunities each returned
+        for i, keyword in enumerate(KEYWORDS, 1):
+            err, stats, results = '', {'total_reported': '', 'links_found': 0, 'pages': 0}, {}
             try:
-                results=scrape_search_keyword(page,keyword)
-                logging.info('[%s/%s] %s => %s results',i,len(KEYWORDS),keyword,len(results))
-                for k,v in results.items():
+                results, stats = scrape_search_keyword(page, keyword)
+                new_cnt = sum(1 for k, v in results.items() if not find_prior(k, v['url']))
+                for k, v in results.items():
                     if k in found: found[k]['keywords'].add(keyword)
-                    else: found[k]={'url':v['url'],'keywords':{keyword}}
+                    else: found[k] = {'url': v['url'], 'keywords': {keyword}}
             except Exception as e:
-                logging.exception('Search failed for keyword: %s',keyword); failures.append({'keyword':keyword,'error':str(e)})
+                logging.exception('Search failed for keyword: %s', keyword)
+                err = str(e)[:300]; new_cnt = 0
+                failures.append({'keyword': keyword, 'error': err})
+            logging.info('[%s/%s] %s => reported=%s links=%s pages=%s', i, len(KEYWORDS), keyword,
+                         stats['total_reported'], stats['links_found'], stats['pages'])
+            keyword_stats.append({'keyword': keyword, **stats, 'new_events': new_cnt, 'error': err})
+            log_rows.append([today_str(), run_started.strftime('%H:%M:%S'), keyword, 'OPEN', stats['total_reported'],
+                             stats['links_found'], new_cnt, stats['pages'], err])
             time.sleep(DELAY)
-        # Revisit newly discovered records and existing tracker records daily, so later edits are detected.
-        urls=[]
-        for key,item in found.items(): urls.append((key,item))
-        known_urls = {clean(item['url']) for _, item in urls}
+
+        # ---- 2. build the detail queue: newly found events + stored events that may still change
+        queue = {}
+        for key, item in found.items():
+            queue[url_key(item['url'])] = (key, item['url'], set(item['keywords']), True)
         for old in old_all:
-            old_url = clean(old.get('Official Source URL',''))
-            old_id = clean(old.get('Event ID','')) or clean(old.get('Opportunity ID',''))
-            if old_url and old_id and old_url.split('#')[0] not in {u.split('#')[0] for u in known_urls}:
-                urls.append((old_id, {'url': old_url, 'keywords': set(filter(None, clean(old.get('Search Keywords Matched','')).split(';')))}))
-                known_urls.add(old_url)
-        if len(urls)>MAX_DETAILS:
-            # Prioritize new records, then records with oldest verification date.
-            urls.sort(key=lambda kv: (0 if kv[0] not in old_by_id else 1, old_by_id.get(kv[0],{}).get('Last Verified Date','')))
-            urls=urls[:MAX_DETAILS]
-        records=[]
-        for n,(key,item) in enumerate(urls,1):
+            u = clean(old.get('Official Source URL', ''))
+            if not u or url_key(u) in queue: continue
+            if clean(old.get('Event Status', '')).lower() in CLOSED_STATUSES: continue   # final states: stop re-checking
+            kws = {x.strip() for x in clean(old.get('Search Keywords Matched', '')).split(';') if x.strip()}
+            queue[url_key(u)] = (clean(old.get('Event ID')) or clean(old.get('Opportunity ID')), u, kws, False)
+        items = list(queue.values())
+        if len(items) > MAX_DETAILS:
+            items.sort(key=lambda it: (0 if not find_prior(it[0], it[1]) else 1,
+                                       clean(find_prior(it[0], it[1]).get('Last Verified Date', ''))))
+            items = items[:MAX_DETAILS]
+
+        # ---- 3. scrape each detail page
+        for n, (key, url, kws, seen_today) in enumerate(items, 1):
             try:
-                row=scrape_details(page,item['url'],item['keywords'])
-                oid=clean(row['Opportunity ID'])
-                prior=old_by_id.get(oid,{})
-                if not prior:
-                    prior=old_by_url.get(clean(item['url']).split('#')[0], {})
-                if not prior:
-                    prior=next((old for old in old_all if clean(old.get('Event ID','')) == clean(row.get('Event ID','')) and clean(row.get('Event ID',''))), {})
-                row['Date Found']=prior.get('Date Found') or datetime.now().strftime('%Y-%m-%d')
-                row['First Seen Date']=prior.get('First Seen Date') or row['Date Found']
-                row['Last Seen Date']=datetime.now().strftime('%Y-%m-%d')
-                # Preserve existing verified values when the page extraction is blank, plus human-entered review fields.
-                for col in ['Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)','Customer / Contract Fit (0-15)','Delivery Capability (0-15)',
-                    'Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)','Information Completeness (0-5)','Total Score (0-100)',
-                    'Mandatory Gate (Pass / Fail / Unknown)','Recommendation (Go / Investigate / No-Go)','Fit Rationale','Risks / Gaps','Next Action','Owner','Review Status','Reviewer Notes',
-                    'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)']:
-                    if clean(prior.get(col,'')) and not clean(row.get(col,'')): row[col]=prior[col]
-                for col in ['Healthcare IT Fit (0-25)','Eligibility & Compliance (0-20)','Customer / Contract Fit (0-15)','Delivery Capability (0-15)',
-                    'Deadline Feasibility (0-10)','Commercial Attractiveness (0-10)','Information Completeness (0-5)','Total Score (0-100)',
-                    'Mandatory Gate (Pass / Fail / Unknown)','Recommendation (Go / Investigate / No-Go)','Fit Rationale','Risks / Gaps','Next Action','Owner','Review Status','Reviewer Notes',
-                    'Eligibility / Mandatory Requirements','Required Certifications / Experience','Contract Duration / Options','Incumbent / Prior Award (verified only)']:
-                    if clean(prior.get(col,'')): row[col]=prior[col]
-                row['Record Hash']=hash_record(row)
+                row = scrape_details(page, url, kws)
+                prior = find_prior(row.get('Event ID'), url)
+                status = clean(row.get('Event Status')).lower()
+                if not prior and status in CLOSED_STATUSES:
+                    skipped_not_open += 1
+                    logging.info('Skipping new non-open event %s (%s)', row.get('Event ID'), status)
+                    continue
+                row = merge_with_prior(row, prior, seen_today)
+                reasons, optional = validate_record(row)
+                row['Failure Reason'] = '; '.join(reasons)
+                row['Missing Fields'] = ', '.join(optional)
+                if reasons:    # save the page text so selectors can be fixed from the Actions artifact
+                    safe = re.sub(r'[^A-Za-z0-9_-]+', '_', row.get('Event ID') or row['Opportunity ID'])
+                    with open(f'{DEBUG_DIR}/{safe}.txt', 'w', encoding='utf-8') as f:
+                        f.write(url + '\n\n' + row.get('_page_text', ''))
+                row.pop('_page_text', None)
+                row['_reasons'] = reasons
                 records.append(row)
-                logging.info('Details %s/%s: %s',n,len(urls),oid)
+                logging.info('Details %s/%s: %s %s', n, len(items), row['Opportunity ID'], 'OK' if not reasons else 'REVIEW: ' + row['Failure Reason'])
             except Exception as e:
-                logging.exception('Detail failed for %s',item['url']); failures.append({'url':item['url'],'error':str(e)})
+                logging.exception('Detail failed for %s', url)
+                detail_failures.append({'url': url, 'error': str(e)[:300]})
             time.sleep(DELAY)
         browser.close()
-    lead_records=[]
-    review_records=[]
-    for r in records:
-        if is_complete_record(r):
-            lead_records.append(r)
-        else:
-            review_records.append(r)
-    # Tracker contains only records passing core-field validation; ambiguous/incomplete records go to Manual Review.
+
+    # ---- 4. split: complete -> Tracker, incomplete -> Manual Review (with the reason)
+    lead_records = [r for r in records if not r['_reasons']]
+    review_records = [r for r in records if r['_reasons']]
+    for r in lead_records: r['Failure Reason'] = ''
+    for r in review_records:
+        r['Date Added to Review'] = clean(r.get('Date Added to Review')) or today_str()
+        if not clean(r.get('Official Source URL')): r['Official Source URL'] = ''
+        r['Review Status'] = clean(r.get('Review Status')) or 'Needs Review'
+    for r in records: r.pop('_reasons', None)
+
     if lead_records:
-        added,updated=upsert_sheet(tracker,tracker_headers,lead_records)
-        logging.info('Tracker sync: %s added, %s updated',added,updated)
-    else:
-        logging.info('Tracker sync: no records passed core-field validation')
-
+        a, u = upsert_sheet(tracker, tracker_headers, lead_records)
+        logging.info('Tracker sync: %s added, %s updated', a, u)
     if review_records:
-        mapped=[{h:r.get(h,'') for h in review_headers} for r in review_records]
-        ra,ru=upsert_sheet(review,review_headers,mapped)
-        logging.info('Manual review sync: %s added, %s updated',ra,ru)
-    else:
-        logging.info('Manual review sync: no records to add/update')
+        a, u = upsert_sheet(review, review_headers, review_records)
+        logging.info('Manual review sync: %s added, %s updated', a, u)
 
-    # Enforce one-sheet-only routing: remove a record from the opposite worksheet
-    # after its latest classification is successfully written to its destination.
-    def remove_matching_rows(ws, moved_records):
-        if not moved_records:
-            return 0
-        _, sheet_rows = rows_as_dicts(ws)
-        ids = set()
-        urls = set()
-        for item in moved_records:
-            if clean(item.get('Event ID','')): ids.add(clean(item.get('Event ID','')))
-            if clean(item.get('Opportunity ID','')): ids.add(clean(item.get('Opportunity ID','')))
-            u = clean(item.get('Official Source URL','')).split('#')[0]
-            if u: urls.add(u)
-        delete_rows = []
-        for idx, existing in enumerate(sheet_rows, start=2):
-            eid = clean(existing.get('Event ID',''))
-            oid = clean(existing.get('Opportunity ID',''))
-            u = clean(existing.get('Official Source URL','')).split('#')[0]
-            if (eid and eid in ids) or (oid and oid in ids) or (u and u in urls):
-                delete_rows.append(idx)
-        for rownum in reversed(delete_rows):
-            ws.delete_rows(rownum)
-        return len(delete_rows)
+    # a record lives in exactly one sheet: remove it from the other one after the write succeeded
+    rm_review = remove_matching_rows(review, lead_records)
+    rm_tracker = remove_matching_rows(tracker, review_records)
+    logging.info('Moved: %s review->tracker, %s tracker->review', rm_review, rm_tracker)
 
-    removed_from_review = remove_matching_rows(review, lead_records)
-    removed_from_tracker = remove_matching_rows(tracker, review_records)
-    if removed_from_review:
-        logging.info('Removed %s record(s) from Manual Review after they qualified for Tracker', removed_from_review)
-    if removed_from_tracker:
-        logging.info('Removed %s record(s) from Tracker after they were routed to Manual Review', removed_from_tracker)
-    diagnostics={'run_at':datetime.now(timezone.utc).isoformat(),'keywords_total':len(KEYWORDS),'unique_events_discovered':len(found),
-      'details_attempted':len(urls) if 'urls' in locals() else 0,'records_scraped':len(records),'tracker_records':len(lead_records),
-      'manual_review_records':len(review_records),'search_failures':failures,'tracker_gid':TRACKER_GID,'review_gid':REVIEW_GID,'max_details_per_run':MAX_DETAILS}
+    if log_rows:
+        with_retries(lambda: log_ws.append_rows(log_rows, value_input_option='RAW'), 'keyword log')
+
+    total_reported = sum(k['total_reported'] for k in keyword_stats if isinstance(k['total_reported'], int))
+    diagnostics = {
+        'run_at': run_started.isoformat(), 'status_filter': 'OPEN', 'keywords_total': len(KEYWORDS),
+        'keyword_stats': keyword_stats, 'sum_of_reported_results_all_keywords': total_reported,
+        'unique_events_discovered': len(found), 'details_attempted': len(items),
+        'records_scraped': len(records), 'tracker_records': len(lead_records), 'manual_review_records': len(review_records),
+        'changed_records': sum(1 for r in records if clean(r.get('Last Changed Date')) == today_str()),
+        'skipped_new_non_open': skipped_not_open, 'moved_review_to_tracker': rm_review, 'moved_tracker_to_review': rm_tracker,
+        'search_failures': failures, 'detail_failures': detail_failures,
+        'tracker_gid': TRACKER_GID, 'review_gid': REVIEW_GID, 'max_details_per_run': MAX_DETAILS}
+
     _, tracker_snapshot = rows_as_dicts(tracker)
     _, review_snapshot = rows_as_dicts(review)
     export_data(tracker_snapshot, review_snapshot, diagnostics)
-    for filename in ['data/georgia_leads.csv','data/georgia_leads.json','data/georgia_manual_review.csv','data/georgia_manual_review.json','data/georgia_diagnostics.json']:
-        logging.info('Data export ready: %s (%s bytes)', filename, os.path.getsize(filename))
-    logging.info('Diagnostics: %s',json.dumps(diagnostics))
-    if not found and not records:
-        raise RuntimeError('No event-detail links were found and no existing events could be refreshed. Check the search selectors and inspect the Actions log for the first failed keyword/detail page.')
+    logging.info('Diagnostics: %s', json.dumps({k: v for k, v in diagnostics.items() if k != 'keyword_stats'}))
 
-if __name__=='__main__': main()
+    if len(failures) == len(KEYWORDS):
+        raise RuntimeError('Every keyword search failed - check selectors / site availability in the Actions log.')
+    if not found and not records:
+        raise RuntimeError('No event-detail links were found and no stored events could be refreshed.')
+
+
+if __name__ == '__main__':
+    main()
