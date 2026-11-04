@@ -1,5 +1,5 @@
 {
-  "run_at": "2026-11-03T05:19:14.441164+00:00",
+  "run_at": "2026-11-04T05:22:53.811715+00:00",
   "status_filter": "OPEN",
   "keywords_total": 23,
   "keyword_stats": [
@@ -194,7 +194,7 @@
   "records_scraped": 1,
   "tracker_records": 1,
   "manual_review_records": 0,
-  "changed_records": 0,
+  "changed_records": 1,
   "skipped_new_non_open": 0,
   "moved_review_to_tracker": 0,
   "moved_tracker_to_review": 0,
