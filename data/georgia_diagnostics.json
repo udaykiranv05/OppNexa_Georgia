@@ -1,5 +1,5 @@
 {
-  "run_at": "2026-11-13T05:24:13.320544+00:00",
+  "run_at": "2026-11-14T05:16:09.377599+00:00",
   "status_filter": "OPEN",
   "keywords_total": 23,
   "keyword_stats": [
@@ -101,9 +101,9 @@
     },
     {
       "keyword": "Application Development",
-      "total_reported": 1,
-      "links_found": 1,
-      "pages": 1,
+      "total_reported": 0,
+      "links_found": 0,
+      "pages": 0,
       "new_events": 0,
       "error": ""
     },
@@ -188,8 +188,8 @@
       "error": ""
     }
   ],
-  "sum_of_reported_results_all_keywords": 1,
-  "unique_events_discovered": 1,
+  "sum_of_reported_results_all_keywords": 0,
+  "unique_events_discovered": 0,
   "details_attempted": 1,
   "records_scraped": 1,
   "tracker_records": 1,
