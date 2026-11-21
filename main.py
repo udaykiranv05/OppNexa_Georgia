@@ -321,7 +321,8 @@ def scrape_search_keyword(page, keyword):
         try:
             opts = [clean(x) for x in sel.locator('option').all_inner_texts()]
             if any(x.upper() == 'OPEN' for x in opts):
-                sel.select_option(label=re.compile('^OPEN$', re.I))
+                # sel.select_option(label=re.compile('^OPEN$', re.I))
+                sel.select_option(label="OPEN")
             elif opts and all(re.fullmatch(r'\d+', o) for o in opts):
                 sel.select_option(label=max(opts, key=int))
         except Exception:
